@@ -3,6 +3,7 @@
 The pipeline injects release metadata (APP_VERSION, GIT_SHA, APP_ENV) so that
 every log line and API response can be traced back to a specific commit.
 """
+import random
 import json
 import logging
 import os
