@@ -51,23 +51,23 @@ stages:
             clean: true
 
           - powershell: |
-              python --version
-              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]python not found on the agent"; exit 1 }
-              python -m venv .venv
+              py --version
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]py not found on the agent"; exit 1 }
+              py -m venv .venv
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]venv creation failed"; exit 1 }
-              .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+              .\.venv\Scripts\py.exe -m pip install -r requirements-dev.txt
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip install failed"; exit 1 }
             workingDirectory: app
             displayName: Install dependencies
 
           - powershell: |
-              .\.venv\Scripts\python.exe -m ruff check .
+              .\.venv\Scripts\py.exe -m ruff check .
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Lint check failed"; exit 1 }
             workingDirectory: app
             displayName: Code quality (ruff)
 
           - powershell: |
-              .\.venv\Scripts\python.exe -m pytest --junitxml=test-results.xml
+              .\.venv\Scripts\py.exe -m pytest --junitxml=test-results.xml
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Unit tests failed"; exit 1 }
             workingDirectory: app
             displayName: Unit tests (pytest)
