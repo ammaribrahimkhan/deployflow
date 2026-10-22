@@ -14,7 +14,7 @@ def client(monkeypatch):
 
 
 def test_health_returns_healthy(client):
-    response = client.get("/health")
+    response = client.get("/broken")
     assert response.status_code == 200
     assert response.get_json()["status"] == "healthy"
 
