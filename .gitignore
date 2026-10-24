@@ -12,10 +12,12 @@ __pycache__/
 *.pem
 *.key
 
-# Terraform (used later; state must NEVER be committed)
+# Terraform (state and plans must NEVER be committed)
 .terraform/
 *.tfstate
 *.tfstate.*
+*.tfplan
+tfplan
 *.tfvars
 crash.log
 

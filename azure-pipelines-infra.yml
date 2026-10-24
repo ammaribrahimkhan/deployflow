@@ -1,0 +1,69 @@
+# DeployFlow infrastructure checks (Milestone 3)
+#
+# Checks Terraform formatting and validity. Needs NO Azure credentials:
+# "init -backend=false" never touches the remote state.
+# Plan/apply with approvals is added in Milestone 5.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/*
+      - azure-pipelines-infra.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/*
+      - azure-pipelines-infra.yml
+
+pool:
+  name: deployflow-laptop-pool
+
+steps:
+  - checkout: self
+    clean: true
+
+  - powershell: |
+      terraform version
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
+        exit 1
+      }
+    displayName: Terraform version
+
+  - powershell: |
+      terraform fmt -check -recursive -diff
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "##vso[task.logissue type=error]Formatting problems found. Run: terraform fmt -recursive"
+        exit 1
+      }
+    workingDirectory: infra
+    displayName: Terraform format check
+
+  - powershell: |
+      $stacks = @("shared", "envs/dev")
+      foreach ($stack in $stacks) {
+        Write-Host "=== Validating $stack ==="
+        Push-Location $stack
+        terraform init -backend=false -input=false
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=error]terraform init failed in $stack"
+          exit 1
+        }
+        terraform validate
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=error]terraform validate failed in $stack"
+          exit 1
+        }
+        Pop-Location
+      }
+    workingDirectory: infra
+    displayName: Terraform validate

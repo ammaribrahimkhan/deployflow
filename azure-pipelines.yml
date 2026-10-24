@@ -1,4 +1,4 @@
-# DeployFlow CI pipeline (Milestone 2)
+# DeployFlow CI pipeline (Milestone 3: now pushes to the Terraform-managed shared registry)
 #
 # Runs on the self-hosted laptop agent (Windows, PowerShell).
 # - Pull requests: lint + unit tests only. Nothing is pushed anywhere.
@@ -31,8 +31,8 @@ pool:
   name: deployflow-laptop-pool
 
 variables:
-  acrName: acrdeployflowammar03
-  acrLoginServer: acrdeployflowammar03.azurecr.io
+  acrName: acrdeployflowsharedammar03
+  acrLoginServer: acrdeployflowsharedammar03.azurecr.io
   imageName: deployflow-app
   azureServiceConnection: sc-azure-deployflow
   appVersion: 1.0.$(Build.BuildId)
@@ -51,9 +51,9 @@ stages:
             clean: true
 
           - powershell: |
-              py --version
-              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]py not found on the agent"; exit 1 }
-              py -m venv .venv
+              python --version
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]python not found on the agent"; exit 1 }
+              python -m venv .venv
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]venv creation failed"; exit 1 }
               .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip install failed"; exit 1 }
@@ -72,7 +72,6 @@ stages:
             workingDirectory: app
             displayName: Unit tests (pytest)
 
-
           - task: PublishTestResults@2
             displayName: Publish test results
             condition: succeededOrFailed()
@@ -80,6 +79,10 @@ stages:
               testResultsFormat: JUnit
               testResultsFiles: app/test-results.xml
               testRunTitle: DeployFlow unit tests
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: build, verify and publish the image. Never runs for pull requests.
+  # ---------------------------------------------------------------------------
   - stage: BuildPush
     displayName: Build, verify and publish image
     dependsOn: Test
@@ -90,6 +93,7 @@ stages:
         steps:
           - checkout: self
             clean: true
+
           - task: AzureCLI@2
             displayName: Build image, smoke test it, push to ACR
             inputs:
@@ -103,11 +107,14 @@ stages:
                   Write-Host "##vso[task.logissue type=error]$message"
                   exit 1
                 }
+
                 $sha = "$(Build.SourceVersion)".Substring(0, 7)
                 $image = "$(acrLoginServer)/$(imageName)"
                 $tag = "${image}:$sha"
                 $container = "df-smoke-$(Build.BuildId)"
                 $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+                # 1. Build. The commit SHA and build info are stored as image labels.
                 Write-Host "Building $tag"
                 docker build `
                   --build-arg APP_VERSION=$(appVersion) `
@@ -120,9 +127,11 @@ stages:
                   --tag $tag `
                   .
                 if ($LASTEXITCODE -ne 0) { Fail "docker build failed" }
+
                 # 2. Smoke test: run the image we just built and check it is healthy.
                 docker run -d --name $container -p 18080:3000 -e APP_ENV=ci-smoke $tag | Out-Null
                 if ($LASTEXITCODE -ne 0) { Fail "docker run failed (is port 18080 already in use?)" }
+
                 $failure = $null
                 $healthy = $false
                 for ($i = 1; $i -le 30; $i++) {
@@ -133,6 +142,7 @@ stages:
                     Start-Sleep -Seconds 1
                   }
                 }
+
                 if (-not $healthy) {
                   $failure = "Smoke test failed: /health never reported healthy"
                   docker logs $container
@@ -144,16 +154,22 @@ stages:
                     Write-Host "Smoke test passed: image reports commit $($info.gitSha)"
                   }
                 }
+
                 docker rm -f $container | Out-Null
                 if ($failure) { Fail $failure }
+
+                # 3. Push to ACR using the pipeline's federated identity.
                 az acr login --name $(acrName)
                 if ($LASTEXITCODE -ne 0) { Fail "az acr login failed" }
+
                 docker push $tag
                 if ($LASTEXITCODE -ne 0) { Fail "docker push failed" }
+
                 $digest = az acr repository show --name $(acrName) --image "$(imageName):$sha" --query digest -o tsv
                 if ($LASTEXITCODE -ne 0 -or -not $digest) { Fail "Could not read the image digest from ACR" }
                 Write-Host "Pushed $tag"
                 Write-Host "Digest: $digest"
+
                 # 4. Save release metadata: ties commit, build and image together.
                 $meta = [ordered]@{
                   application    = "deployflow-app"
@@ -174,7 +190,9 @@ stages:
                 $path = Join-Path "$(Build.ArtifactStagingDirectory)" "release-metadata.json"
                 [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
                 Write-Host $json
+
                 docker logout $(acrLoginServer) | Out-Null
+
           - publish: $(Build.ArtifactStagingDirectory)/release-metadata.json
             artifact: release-metadata
             displayName: Publish release metadata

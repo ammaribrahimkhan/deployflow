@@ -2,17 +2,20 @@
 
 | Identity | Type | Scope | Role | Why it needs it |
 |---|---|---|---|---|
-| `sc-azure-deployflow` (Entra app registration created by Azure DevOps) | Service principal using workload identity federation (no stored secret) | Resource group `rg-deployflow-manual-eus2` only | Contributor | Log in to ACR, push images and read the image digest |
-| `ca-deployflow-manual` (system-assigned managed identity) | Managed identity | Container Registry `acrdeployflowammar03` | AcrPull | Pull the image at runtime without a password |
-| `laptop-agent-01` | Self-hosted agent on the developer laptop | Agent pool `deployflow-laptop-pool` | Registered with a short-lived PAT, since revoked | Run pipeline jobs |
+| `sc-azure-deployflow` (Entra app registration created by Azure DevOps) | Service principal using workload identity federation (no stored secret) | Resource group `rg-deployflow-shared-eus2` | Contributor (assigned by Terraform, `infra/shared`) | Log in to the registry, push images, read the image digest |
+| `id-deployflow-dev-eus2` | User-assigned managed identity | Registry `acrdeployflowsharedammar03` | AcrPull (assigned by Terraform) | Pull the image at runtime without a password |
+| Developer (Ammar) | Human, Microsoft Entra sign-in | Subscription, plus the state storage account | Owner, Storage Blob Data Contributor | Run Terraform from the laptop |
+| `laptop-agent-01` | Self-hosted agent on the developer laptop | Agent pool `deployflow-laptop-pool` | Registered once with a short-lived PAT, since revoked | Run pipeline jobs |
 
 ## Rules
 
 - No passwords, keys or tokens are stored in the repository or in pipeline variables.
-- Pull request runs execute tests only. They never log in to Azure and never push images.
+- Pull request runs execute tests and Terraform format/validate only. They never log in to Azure and never push images.
+- The Terraform state storage account has shared-key access disabled: only Entra identities with a data role can read state.
 - The GitHub repository is private. Pull requests from forks must not be built on the self-hosted agent.
 
 ## Known trade-offs (to tighten later)
 
-- Contributor on the resource group is broader than required for pushing images. Milestone 3 replaces it with narrower roles managed by Terraform.
-- The self-hosted agent runs on a personal laptop. Only trusted code from this private repository should ever run there.
+- Contributor on the shared resource group is broader than strictly needed for pushing images. The group contains only the registry, so the blast radius is small. A narrower role is a candidate improvement once tested.
+- Terraform is run from the developer laptop for now. Milestone 5 adds approval-gated pipeline runs.
+- The self-hosted agent runs on a personal laptop. Only trusted code from this private repository should run there.
