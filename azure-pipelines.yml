@@ -38,9 +38,6 @@ variables:
   appVersion: 1.0.$(Build.BuildId)
 
 stages:
-  # ---------------------------------------------------------------------------
-  # Stage 1: quality gate. If anything here fails, nothing gets built.
-  # ---------------------------------------------------------------------------
   - stage: Test
     displayName: Lint and unit tests
     jobs:
@@ -52,22 +49,24 @@ stages:
 
           - powershell: |
               py --version
-              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]py not found on the agent"; exit 1 }
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Python launcher not found on the agent"; exit 1 }
+
               py -m venv .venv
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]venv creation failed"; exit 1 }
-              .\.venv\Scripts\py.exe -m pip install -r requirements-dev.txt
+
+              .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip install failed"; exit 1 }
             workingDirectory: app
             displayName: Install dependencies
 
           - powershell: |
-              .\.venv\Scripts\py.exe -m ruff check .
+              .\.venv\Scripts\python.exe -m ruff check .
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Lint check failed"; exit 1 }
             workingDirectory: app
             displayName: Code quality (ruff)
 
           - powershell: |
-              .\.venv\Scripts\py.exe -m pytest --junitxml=test-results.xml
+              .\.venv\Scripts\python.exe -m pytest --junitxml=test-results.xml
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Unit tests failed"; exit 1 }
             workingDirectory: app
             displayName: Unit tests (pytest)
@@ -80,9 +79,6 @@ stages:
               testResultsFiles: app/test-results.xml
               testRunTitle: DeployFlow unit tests
 
-  # ---------------------------------------------------------------------------
-  # Stage 2: build, verify and publish the image. Never runs for pull requests.
-  # ---------------------------------------------------------------------------
   - stage: BuildPush
     displayName: Build, verify and publish image
     dependsOn: Test
@@ -95,7 +91,7 @@ stages:
             clean: true
 
           - task: AzureCLI@2
-            displayName: Build image, smoke test it, push to ACR
+            displayName: Build image, smoke test, push to ACR
             inputs:
               azureSubscription: $(azureServiceConnection)
               scriptType: ps
@@ -114,7 +110,6 @@ stages:
                 $container = "df-smoke-$(Build.BuildId)"
                 $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-                # 1. Build. The commit SHA and build info are stored as image labels.
                 Write-Host "Building $tag"
                 docker build `
                   --build-arg APP_VERSION=$(appVersion) `
@@ -128,7 +123,6 @@ stages:
                   .
                 if ($LASTEXITCODE -ne 0) { Fail "docker build failed" }
 
-                # 2. Smoke test: run the image we just built and check it is healthy.
                 docker run -d --name $container -p 18080:3000 -e APP_ENV=ci-smoke $tag | Out-Null
                 if ($LASTEXITCODE -ne 0) { Fail "docker run failed (is port 18080 already in use?)" }
 
@@ -158,7 +152,6 @@ stages:
                 docker rm -f $container | Out-Null
                 if ($failure) { Fail $failure }
 
-                # 3. Push to ACR using the pipeline's federated identity.
                 az acr login --name $(acrName)
                 if ($LASTEXITCODE -ne 0) { Fail "az acr login failed" }
 
@@ -170,21 +163,20 @@ stages:
                 Write-Host "Pushed $tag"
                 Write-Host "Digest: $digest"
 
-                # 4. Save release metadata: ties commit, build and image together.
                 $meta = [ordered]@{
-                  application    = "deployflow-app"
-                  gitSha         = "$(Build.SourceVersion)"
-                  shortSha       = $sha
-                  branch         = "$(Build.SourceBranchName)"
-                  buildId        = [int]"$(Build.BuildId)"
-                  buildNumber    = "$(Build.BuildNumber)"
-                  appVersion     = "$(appVersion)"
+                  application     = "deployflow-app"
+                  gitSha          = "$(Build.SourceVersion)"
+                  shortSha        = $sha
+                  branch          = "$(Build.SourceBranchName)"
+                  buildId         = [int]"$(Build.BuildId)"
+                  buildNumber     = "$(Build.BuildNumber)"
+                  appVersion      = "$(appVersion)"
                   imageRepository = $image
-                  imageTag       = $sha
-                  imageDigest    = $digest
-                  imageReference = ("{0}@{1}" -f $image, $digest)
-                  builtAtUtc     = $builtAt
-                  pipelineRunUrl = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                  imageTag        = $sha
+                  imageDigest     = $digest
+                  imageReference  = ("{0}@{1}" -f $image, $digest)
+                  builtAtUtc      = $builtAt
+                  pipelineRunUrl  = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
                 }
                 $json = $meta | ConvertTo-Json
                 $path = Join-Path "$(Build.ArtifactStagingDirectory)" "release-metadata.json"
