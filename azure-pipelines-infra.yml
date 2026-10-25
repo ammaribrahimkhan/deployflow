@@ -1,5 +1,5 @@
 # DeployFlow infrastructure checks (Milestone 3)
-# Checks Terraform formatting and validity without external extensions.
+# Checks Terraform formatting and validity with targeted local path mapping.
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -28,19 +28,14 @@ steps:
   - checkout: self
     clean: true
 
-  # Robust Fix: Scan and prepend all common local Windows installation paths to the active runner environment
+  # Robust Fix: Map your exact WinGet local package directory onto the active runner thread context
   - powershell: |
-      $pathsToMap = @(
-          "C:\Program Files\Terraform",
-          "$env:LOCALAPPDATA\Microsoft\WinGet\Links",
-          "C:\Terraform"
-      )
-      
-      foreach ($path in $pathsToMap) {
-          if (Test-Path $path) {
-              Write-Host "Found Terraform directory! Prepending to pipeline PATH: $path"
-              echo "##vso[task.prependpath]$path"
-          }
+      $targetPath = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe"
+      if (Test-Path $targetPath) {
+          Write-Host "Found your local WinGet Terraform package folder! Prepending to pipeline PATH: $targetPath"
+          echo "##vso[task.prependpath]$targetPath"
+      } else {
+          Write-Host "##vso[task.logissue type=warning]Specified package folder path could not be located by the runner service context."
       }
     displayName: Map Local Terraform Path
 
