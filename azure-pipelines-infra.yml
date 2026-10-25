@@ -31,6 +31,12 @@ steps:
   - checkout: self
     clean: true
 
+  # FIX: Installs the missing terraform binary directly on your self-hosted laptop agent
+  - task: TerraformInstaller@1
+    displayName: Install Terraform
+    inputs:
+      terraformVersion: 'latest'
+
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
