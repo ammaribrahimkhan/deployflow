@@ -1,8 +1,5 @@
 # DeployFlow infrastructure checks (Milestone 3)
-#
-# Checks Terraform formatting and validity. Needs NO Azure credentials:
-# "init -backend=false" never touches the remote state.
-# Plan/apply with approvals is added in Milestone 5.
+# Checks Terraform formatting and validity without external extensions.
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -31,16 +28,21 @@ steps:
   - checkout: self
     clean: true
 
-  # FIX: Installs the missing terraform binary directly on your self-hosted laptop agent
-  - task: TerraformInstaller@1
-    displayName: Install Terraform
-    inputs:
-      terraformVersion: 'latest'
+  # Native Fix: Explicitly updates the PATH variable to include your local laptop's winget link location
+  - powershell: |
+      $wingetPath = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+      if (Test-Path $wingetPath) {
+          Write-Host "Adding WinGet links directory to environment PATH: $wingetPath"
+          echo "##vso[task.prependpath]$wingetPath"
+      } else {
+          Write-Host "Standard WinGet path not found. Checking system paths..."
+      }
+    displayName: Map Local Terraform Path
 
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
+        Write-Host "##vso[task.logissue type=error]terraform not found on your laptop agent."
         exit 1
       }
     displayName: Terraform version
