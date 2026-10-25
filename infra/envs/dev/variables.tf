@@ -28,10 +28,16 @@ variable "acr_name" {
   default     = "acrdeployflowsharedammar03"
 }
 
-variable "acr_resource_group_name" {
-  description = "Resource group of the shared container registry."
+variable "shared_resource_group_name" {
+  description = "Resource group that holds the shared registry and Container Apps environment."
   type        = string
   default     = "rg-deployflow-shared-eus2"
+}
+
+variable "container_app_environment_name" {
+  description = "Name of the shared Container Apps environment."
+  type        = string
+  default     = "cae-deployflow-shared-eus2"
 }
 
 variable "image_name" {

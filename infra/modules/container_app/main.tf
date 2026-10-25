@@ -21,18 +21,10 @@ resource "time_sleep" "wait_for_role_assignment" {
   create_duration = "60s"
 }
 
-resource "azurerm_container_app_environment" "this" {
-  name                       = "cae-${var.project}-${var.environment}-${var.location_short}"
-  location                   = var.location
-  resource_group_name        = var.resource_group_name
-  log_analytics_workspace_id = var.log_analytics_workspace_id
-  tags                       = var.tags
-}
-
 resource "azurerm_container_app" "this" {
   name                         = "ca-${var.project}-${var.environment}"
   resource_group_name          = var.resource_group_name
-  container_app_environment_id = azurerm_container_app_environment.this.id
+  container_app_environment_id = var.container_app_environment_id
 
   # "Multiple" lets two revisions run side by side (needed for traffic splitting in Milestone 6).
   revision_mode = "Multiple"

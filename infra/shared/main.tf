@@ -35,3 +35,24 @@ resource "azurerm_role_assignment" "pipeline_contributor" {
   principal_type                   = "ServicePrincipal"
   skip_service_principal_aad_check = true
 }
+
+# Platform logs: everything the Container Apps environment writes goes here.
+resource "azurerm_log_analytics_workspace" "platform" {
+  name                = "log-${var.project}-shared-${var.location_short}"
+  location            = azurerm_resource_group.shared.location
+  resource_group_name = azurerm_resource_group.shared.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+  daily_quota_gb      = 0.5
+  tags                = local.tags
+}
+
+# The ONE Container Apps environment (free subscriptions allow only one).
+# Dev, staging and production run as separate apps inside it.
+resource "azurerm_container_app_environment" "shared" {
+  name                       = "cae-${var.project}-shared-${var.location_short}"
+  location                   = azurerm_resource_group.shared.location
+  resource_group_name        = azurerm_resource_group.shared.name
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.platform.id
+  tags                       = local.tags
+}

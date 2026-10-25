@@ -29,8 +29,8 @@ variable "tags" {
   default     = {}
 }
 
-variable "log_analytics_workspace_id" {
-  description = "Log Analytics workspace that receives the environment's logs."
+variable "container_app_environment_id" {
+  description = "ID of the shared Azure Container Apps environment the app runs in."
   type        = string
 }
 
