@@ -28,21 +28,26 @@ steps:
   - checkout: self
     clean: true
 
-  # Native Fix: Explicitly updates the PATH variable to include your local laptop's winget link location
+  # Robust Fix: Scan and prepend all common local Windows installation paths to the active runner environment
   - powershell: |
-      $wingetPath = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
-      if (Test-Path $wingetPath) {
-          Write-Host "Adding WinGet links directory to environment PATH: $wingetPath"
-          echo "##vso[task.prependpath]$wingetPath"
-      } else {
-          Write-Host "Standard WinGet path not found. Checking system paths..."
+      $pathsToMap = @(
+          "C:\Program Files\Terraform",
+          "$env:LOCALAPPDATA\Microsoft\WinGet\Links",
+          "C:\Terraform"
+      )
+      
+      foreach ($path in $pathsToMap) {
+          if (Test-Path $path) {
+              Write-Host "Found Terraform directory! Prepending to pipeline PATH: $path"
+              echo "##vso[task.prependpath]$path"
+          }
       }
     displayName: Map Local Terraform Path
 
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform not found on your laptop agent."
+        Write-Host "##vso[task.logissue type=error]terraform command still not reachable on the agent."
         exit 1
       }
     displayName: Terraform version
