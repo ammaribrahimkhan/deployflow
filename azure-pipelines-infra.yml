@@ -1,4 +1,3 @@
-
 # DeployFlow infrastructure checks (Milestone 4)
 #
 # Checks Terraform formatting, security misconfigurations and validity.
@@ -38,6 +37,12 @@ variables:
 steps:
   - checkout: self
     clean: true
+
+  # Native alternative: This task ensures a clean terraform version is installed and cached right on your agent laptop
+  - task: TerraformInstaller@1
+    displayName: Install Terraform
+    inputs:
+      terraformVersion: 'latest'
 
   - powershell: |
       terraform version
