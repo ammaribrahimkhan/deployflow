@@ -38,16 +38,23 @@ steps:
   - checkout: self
     clean: true
 
-  # Native alternative: This task ensures a clean terraform version is installed and cached right on your agent laptop
-  - task: TerraformInstaller@1
-    displayName: Install Terraform
-    inputs:
-      terraformVersion: 'latest'
+  # Native fallback: Automatically locate your working local installation path and map it dynamically
+  - powershell: |
+      Write-Host "Checking local environmental paths for terraform binary..."
+      $wingetPath = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe"
+      
+      if (Test-Path "$wingetPath\terraform.exe") {
+          Write-Host "Found local winget terraform version! Injecting binary path to pipeline runtime context..."
+          Write-Host "##vso[task.prependpath]$wingetPath"
+      } else {
+          Write-Host "##vso[task.logissue type=warning]Could not map local package path manually. Attempting default system path execution..."
+      }
+    displayName: Map Local Binary Environment Paths
 
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
+        Write-Host "##vso[task.logissue type=error]terraform command was still not recognized in the pipeline runtime."
         exit 1
       }
     displayName: Terraform version
