@@ -1,0 +1,7 @@
+# Shared pipeline variables.
+#
+# trivyImage is pinned by DIGEST (not by tag). Tags can be moved by an attacker;
+# a digest cannot. Version: aquasec/trivy:0.73.0.
+variables:
+  - name: trivyImage
+    value: aquasec/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c

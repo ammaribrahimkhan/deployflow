@@ -1,11 +1,12 @@
-# DeployFlow CI pipeline (Milestone 3: now pushes to the Terraform-managed shared registry)
+
+# DeployFlow CI pipeline (Milestone 4: security gates)
 #
 # Runs on the self-hosted laptop agent (Windows, PowerShell).
-# - Pull requests: lint + unit tests only. Nothing is pushed anywhere.
-# - Pushes to main: lint + tests, then build, smoke test and push the image to ACR.
+# - Pull requests: security scans, lint, static analysis, unit tests. Nothing is pushed.
+# - Pushes to main (and manual runs): the same checks, then build, smoke test,
+#   image vulnerability scan, SBOM, and ONLY IF EVERYTHING PASSES the push to ACR.
 #
-# No secrets are used. Azure login goes through the workload identity
-# federation service connection, which uses short-lived tokens.
+# Azure credentials exist in exactly one step: the one that pushes to the registry.
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -17,6 +18,9 @@ trigger:
     include:
       - app/*
       - azure-pipelines.yml
+      - pipelines/*
+      - scripts/*
+      - .trivyignore
 
 pr:
   branches:
@@ -26,34 +30,52 @@ pr:
     include:
       - app/*
       - azure-pipelines.yml
+      - pipelines/*
+      - scripts/*
+      - .trivyignore
 
 pool:
   name: deployflow-laptop-pool
 
 variables:
-  acrName: acrdeployflowsharedammar03
-  acrLoginServer: acrdeployflowsharedammar03.azurecr.io
-  imageName: deployflow-app
-  azureServiceConnection: sc-azure-deployflow
-  appVersion: 1.0.$(Build.BuildId)
+  - template: pipelines/variables.yml
+  - name: acrName
+    value: acrdeployflowsharedammar03
+  - name: acrLoginServer
+    value: acrdeployflowsharedammar03.azurecr.io
+  - name: imageName
+    value: deployflow-app
+  - name: azureServiceConnection
+    value: sc-azure-deployflow
+  - name: appVersion
+    value: 1.0.$(Build.BuildId)
 
 stages:
+  # ---------------------------------------------------------------------------
+  # Stage 1: quality and security gate. If anything here fails, nothing is built.
+  # ---------------------------------------------------------------------------
   - stage: Test
-    displayName: Lint and unit tests
+    displayName: Security scans, lint and unit tests
     jobs:
       - job: Test
-        displayName: Lint and unit tests
+        displayName: Security scans, lint and unit tests
         steps:
           - checkout: self
             clean: true
 
           - powershell: |
+              & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("fs", "--scanners", "vuln,secret", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1", "--skip-dirs", "**/.venv", "--skip-dirs", "**/.terraform", "--skip-dirs", ".git", ".")
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "##vso[task.logissue type=error]Source scan failed: HIGH/CRITICAL vulnerability or secret found (or Trivy could not run). Read the log above."
+                exit 1
+              }
+            displayName: Scan source for secrets and vulnerable dependencies (Trivy)
+
+          - powershell: |
               py --version
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Python launcher not found on the agent"; exit 1 }
-
               py -m venv .venv
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]venv creation failed"; exit 1 }
-
               .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip install failed"; exit 1 }
             workingDirectory: app
@@ -64,6 +86,18 @@ stages:
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Lint check failed"; exit 1 }
             workingDirectory: app
             displayName: Code quality (ruff)
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m bandit -r main.py -ll
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Static security analysis found medium or higher issues"; exit 1 }
+            workingDirectory: app
+            displayName: Static security analysis (bandit)
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m pip_audit -r requirements.txt --progress-spinner off
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip-audit found a known vulnerable Python dependency"; exit 1 }
+            workingDirectory: app
+            displayName: Python dependency audit (pip-audit)
 
           - powershell: |
               .\.venv\Scripts\python.exe -m pytest --junitxml=test-results.xml
@@ -79,78 +113,179 @@ stages:
               testResultsFiles: app/test-results.xml
               testRunTitle: DeployFlow unit tests
 
+  # ---------------------------------------------------------------------------
+  # Stage 2: build, scan the image, make the SBOM, then (only if clean) push.
+  # Never runs for pull requests.
+  # ---------------------------------------------------------------------------
   - stage: BuildPush
-    displayName: Build, verify and publish image
+    displayName: Build, scan and publish image
     dependsOn: Test
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
       - job: BuildPush
-        displayName: Build, smoke test, push
+        displayName: Build, scan, push
         steps:
           - checkout: self
             clean: true
 
+          # Step A: build and smoke test. No Azure credentials involved.
+          - powershell: |
+              function Fail($message) {
+                Write-Host "##vso[task.logissue type=error]$message"
+                exit 1
+              }
+
+              $sha = "$(Build.SourceVersion)".Substring(0, 7)
+              $image = "$(acrLoginServer)/$(imageName)"
+              $tag = "${image}:$sha"
+              $container = "df-smoke-$(Build.BuildId)"
+
+              Write-Host "Building $tag"
+              docker build `
+                --build-arg APP_VERSION=$(appVersion) `
+                --build-arg GIT_SHA=$sha `
+                --label "org.opencontainers.image.revision=$(Build.SourceVersion)" `
+                --label "org.opencontainers.image.source=$(Build.Repository.Uri)" `
+                --label "org.opencontainers.image.version=$(appVersion)" `
+                --label "deployflow.build.id=$(Build.BuildId)" `
+                --label "deployflow.build.number=$(Build.BuildNumber)" `
+                --tag $tag `
+                .
+              if ($LASTEXITCODE -ne 0) { Fail "docker build failed" }
+
+              docker run -d --name $container -p 18080:3000 -e APP_ENV=ci-smoke $tag | Out-Null
+              if ($LASTEXITCODE -ne 0) { Fail "docker run failed (is port 18080 already in use?)" }
+
+              $failure = $null
+              $healthy = $false
+              for ($i = 1; $i -le 30; $i++) {
+                try {
+                  $r = Invoke-RestMethod -Uri "http://127.0.0.1:18080/health" -TimeoutSec 2
+                  if ($r.status -eq "healthy") { $healthy = $true; break }
+                } catch {
+                  Start-Sleep -Seconds 1
+                }
+              }
+
+              if (-not $healthy) {
+                $failure = "Smoke test failed: /health never reported healthy"
+                docker logs $container
+              } else {
+                $info = Invoke-RestMethod -Uri "http://127.0.0.1:18080/api/info" -TimeoutSec 5
+                $reportedSha = $info.gitSha
+                if ($reportedSha -ne $sha) {
+                  $failure = "Smoke test failed: image reports commit {0} but expected {1}" -f $reportedSha, $sha
+                } else {
+                  Write-Host "Smoke test passed: image reports commit $reportedSha"
+                }
+              }
+
+              docker rm -f $container | Out-Null
+              if ($failure) { Fail $failure }
+
+              Write-Host "##vso[task.setvariable variable=imageSha]$sha"
+              Write-Host "##vso[task.setvariable variable=imageTag]$tag"
+            workingDirectory: $(Build.SourcesDirectory)\app
+            displayName: Build image and smoke test
+
+          # Step B: vulnerability gate and SBOM. No Azure credentials involved.
+          - powershell: |
+              function Fail($message) {
+                Write-Host "##vso[task.logissue type=error]$message"
+                exit 1
+              }
+              function Write-Utf8($path, $text) {
+                [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false))
+              }
+
+              $src = "$(Build.SourcesDirectory)"
+              $reports = "$(Build.ArtifactStagingDirectory)\reports"
+              $tarDir = "$(Agent.TempDirectory)"
+              $tar = Join-Path $tarDir "image.tar"
+              $trivy = "$(trivyImage)"
+
+              New-Item -ItemType Directory -Force -Path $reports | Out-Null
+              Write-Host "##vso[task.setvariable variable=reportsReady]true"
+
+              docker save -o $tar "$(imageTag)"
+              if ($LASTEXITCODE -ne 0) { Fail "docker save failed" }
+
+              $versionText = (& .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -TrivyArgs @("--version") | Out-String)
+              $trivyVersion = "unknown"
+              if ($versionText -match "Version:\s*(\S+)") { $trivyVersion = $Matches[1] }
+              Write-Host "Trivy version: $trivyVersion"
+
+              # 1. Full JSON report (evidence). Never fails the build by itself.
+              & .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -InputDir $tarDir -OutDir $reports -TrivyArgs @("image", "--input", "/in/image.tar", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--format", "json", "--output", "/out/trivy-image-report.json")
+              if ($LASTEXITCODE -ne 0) { Fail "Trivy could not produce the image report (see the log above)" }
+
+              # 2. SBOM in CycloneDX format.
+              & .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -InputDir $tarDir -OutDir $reports -TrivyArgs @("image", "--input", "/in/image.tar", "--format", "cyclonedx", "--output", "/out/sbom.cdx.json")
+              if ($LASTEXITCODE -ne 0) { Fail "SBOM generation failed" }
+
+              # 3. The gate: HIGH or CRITICAL vulnerabilities that have a fix block the release.
+              & .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -InputDir $tarDir -TrivyArgs @("image", "--input", "/in/image.tar", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1")
+              $gateExit = $LASTEXITCODE
+              $gateResult = "failed"
+              if ($gateExit -eq 0) { $gateResult = "passed" }
+
+              $report = Get-Content (Join-Path $reports "trivy-image-report.json") -Raw | ConvertFrom-Json
+              $vulns = @()
+              foreach ($result in $report.Results) {
+                if ($result.Vulnerabilities) { $vulns += $result.Vulnerabilities }
+              }
+              $critical = @($vulns | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+              $high = @($vulns | Where-Object { $_.Severity -eq "HIGH" }).Count
+
+              $sbomPath = Join-Path $reports "sbom.cdx.json"
+              $sbomHash = (Get-FileHash -Path $sbomPath -Algorithm SHA256).Hash.ToLower()
+              $scannedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+              $summary = [ordered]@{
+                tool              = "trivy"
+                toolVersion       = $trivyVersion
+                toolImage         = $trivy
+                scannedImage      = "$(imageTag)"
+                severityThreshold = "HIGH,CRITICAL"
+                ignoreUnfixed     = $true
+                criticalCount     = $critical
+                highCount         = $high
+                gateResult        = $gateResult
+                sbomFormat        = "CycloneDX"
+                sbomFile          = "sbom.cdx.json"
+                sbomSha256        = $sbomHash
+                scannedAtUtc      = $scannedAt
+              }
+              Write-Utf8 (Join-Path $reports "security-summary.json") ($summary | ConvertTo-Json -Depth 5)
+
+              Remove-Item $tar -Force -ErrorAction SilentlyContinue
+
+              if ($gateExit -ne 0) {
+                Fail "Image scan failed: $critical CRITICAL and $high HIGH fixable vulnerabilities. The image was NOT pushed."
+              }
+              Write-Host "Image scan passed. SBOM written to $sbomPath"
+            displayName: Scan image (Trivy gate) and create SBOM
+
+          # Step C: the only step with Azure credentials. Pushes the scanned image.
           - task: AzureCLI@2
-            displayName: Build image, smoke test, push to ACR
+            displayName: Push scanned image to ACR and write release metadata
             inputs:
               azureSubscription: $(azureServiceConnection)
               scriptType: ps
               scriptLocation: inlineScript
               failOnStandardError: false
-              workingDirectory: $(Build.SourcesDirectory)\app
+              workingDirectory: $(Build.SourcesDirectory)
               inlineScript: |
                 function Fail($message) {
                   Write-Host "##vso[task.logissue type=error]$message"
                   exit 1
                 }
 
-                $sha = "$(Build.SourceVersion)".Substring(0, 7)
+                $sha = "$(imageSha)"
+                $tag = "$(imageTag)"
                 $image = "$(acrLoginServer)/$(imageName)"
-                $tag = "${image}:$sha"
-                $container = "df-smoke-$(Build.BuildId)"
+                $reports = "$(Build.ArtifactStagingDirectory)\reports"
                 $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-                Write-Host "Building $tag"
-                docker build `
-                  --build-arg APP_VERSION=$(appVersion) `
-                  --build-arg GIT_SHA=$sha `
-                  --label "org.opencontainers.image.revision=$(Build.SourceVersion)" `
-                  --label "org.opencontainers.image.source=$(Build.Repository.Uri)" `
-                  --label "org.opencontainers.image.version=$(appVersion)" `
-                  --label "deployflow.build.id=$(Build.BuildId)" `
-                  --label "deployflow.build.number=$(Build.BuildNumber)" `
-                  --tag $tag `
-                  .
-                if ($LASTEXITCODE -ne 0) { Fail "docker build failed" }
-
-                docker run -d --name $container -p 18080:3000 -e APP_ENV=ci-smoke $tag | Out-Null
-                if ($LASTEXITCODE -ne 0) { Fail "docker run failed (is port 18080 already in use?)" }
-
-                $failure = $null
-                $healthy = $false
-                for ($i = 1; $i -le 30; $i++) {
-                  try {
-                    $r = Invoke-RestMethod -Uri "http://127.0.0.1:18080/health" -TimeoutSec 2
-                    if ($r.status -eq "healthy") { $healthy = $true; break }
-                  } catch {
-                    Start-Sleep -Seconds 1
-                  }
-                }
-
-                if (-not $healthy) {
-                  $failure = "Smoke test failed: /health never reported healthy"
-                  docker logs $container
-                } else {
-                  $info = Invoke-RestMethod -Uri "http://127.0.0.1:18080/api/info" -TimeoutSec 5
-                  if ($info.gitSha -ne $sha) {
-                    $failure = "Smoke test failed: image reports commit {0} but expected {1}" -f $info.gitSha, $sha
-                  } else {
-                    Write-Host "Smoke test passed: image reports commit $($info.gitSha)"
-                  }
-                }
-
-                docker rm -f $container | Out-Null
-                if ($failure) { Fail $failure }
 
                 az acr login --name $(acrName)
                 if ($LASTEXITCODE -ne 0) { Fail "az acr login failed" }
@@ -163,13 +298,18 @@ stages:
                 Write-Host "Pushed $tag"
                 Write-Host "Digest: $digest"
 
+                $security = Get-Content (Join-Path $reports "security-summary.json") -Raw | ConvertFrom-Json
+
                 $meta = [ordered]@{
                   application     = "deployflow-app"
                   gitSha          = "$(Build.SourceVersion)"
                   shortSha        = $sha
+                  repository      = "$(Build.Repository.Name)"
                   branch          = "$(Build.SourceBranchName)"
+                  trigger         = "$(Build.Reason)"
                   buildId         = [int]"$(Build.BuildId)"
                   buildNumber     = "$(Build.BuildNumber)"
+                  agentName       = "$(Agent.Name)"
                   appVersion      = "$(appVersion)"
                   imageRepository = $image
                   imageTag        = $sha
@@ -177,14 +317,23 @@ stages:
                   imageReference  = ("{0}@{1}" -f $image, $digest)
                   builtAtUtc      = $builtAt
                   pipelineRunUrl  = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                  security        = $security
                 }
-                $json = $meta | ConvertTo-Json
-                $path = Join-Path "$(Build.ArtifactStagingDirectory)" "release-metadata.json"
+                $json = $meta | ConvertTo-Json -Depth 6
+                $path = Join-Path $reports "release-metadata.json"
                 [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
                 Write-Host $json
 
-                docker logout $(acrLoginServer) | Out-Null
+          - publish: $(Build.ArtifactStagingDirectory)/reports
+            artifact: release-evidence
+            condition: and(always(), eq(variables['reportsReady'], 'true'))
+            displayName: Publish release evidence (SBOM, scan reports, metadata)
 
-          - publish: $(Build.ArtifactStagingDirectory)/release-metadata.json
-            artifact: release-metadata
-            displayName: Publish release metadata
+          - powershell: |
+              $tar = Join-Path "$(Agent.TempDirectory)" "image.tar"
+              if (Test-Path $tar) { Remove-Item $tar -Force }
+              docker rm -f "df-smoke-$(Build.BuildId)" 2>&1 | Out-Null
+              docker logout $(acrLoginServer) 2>&1 | Out-Null
+              exit 0
+            condition: always()
+            displayName: Clean up (temp files, containers, registry login)

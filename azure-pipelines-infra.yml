@@ -1,5 +1,9 @@
-# DeployFlow infrastructure checks (Milestone 3)
-# Checks Terraform formatting and validity with targeted local path mapping.
+
+# DeployFlow infrastructure checks (Milestone 4)
+#
+# Checks Terraform formatting, security misconfigurations and validity.
+# Needs NO Azure credentials: "init -backend=false" never touches the remote state.
+# Plan/apply with approvals is added in Milestone 5.
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -11,6 +15,8 @@ trigger:
     include:
       - infra/*
       - azure-pipelines-infra.yml
+      - pipelines/*
+      - scripts/*
 
 pr:
   branches:
@@ -20,29 +26,23 @@ pr:
     include:
       - infra/*
       - azure-pipelines-infra.yml
+      - pipelines/*
+      - scripts/*
 
 pool:
   name: deployflow-laptop-pool
+
+variables:
+  - template: pipelines/variables.yml
 
 steps:
   - checkout: self
     clean: true
 
-  # Robust Fix: Map your exact WinGet local package directory onto the active runner thread context
-  - powershell: |
-      $targetPath = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe"
-      if (Test-Path $targetPath) {
-          Write-Host "Found your local WinGet Terraform package folder! Prepending to pipeline PATH: $targetPath"
-          echo "##vso[task.prependpath]$targetPath"
-      } else {
-          Write-Host "##vso[task.logissue type=warning]Specified package folder path could not be located by the runner service context."
-      }
-    displayName: Map Local Terraform Path
-
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform command still not reachable on the agent."
+        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
         exit 1
       }
     displayName: Terraform version
@@ -55,6 +55,22 @@ steps:
       }
     workingDirectory: infra
     displayName: Terraform format check
+
+  - powershell: |
+      Write-Host "=== Informational: HIGH and CRITICAL findings (do not block) ==="
+      & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("config", "--severity", "HIGH,CRITICAL", "--exit-code", "0", "infra")
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "##vso[task.logissue type=error]Trivy could not scan the Terraform code (see the log above)"
+        exit 1
+      }
+
+      Write-Host "=== Gate: CRITICAL findings block ==="
+      & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("config", "--severity", "CRITICAL", "--exit-code", "1", "infra")
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "##vso[task.logissue type=error]CRITICAL infrastructure misconfiguration found"
+        exit 1
+      }
+    displayName: Scan Terraform for misconfigurations (Trivy)
 
   - powershell: |
       $stacks = @("shared", "envs/dev")

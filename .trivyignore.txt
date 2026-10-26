@@ -1,0 +1,4 @@
+# Trivy exceptions. Keep this file empty unless there is no safe alternative.
+# Every entry needs: the ID, a short reason in the pull request, and an expiry date.
+# Format:   <ID> exp:YYYY-MM-DD
+# Example:  CVE-2099-00000 exp:2099-01-01
