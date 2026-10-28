@@ -1,8 +1,8 @@
-# DeployFlow infrastructure checks (Milestone 4)
+# DeployFlow infrastructure checks (Milestone 5)
 #
 # Checks Terraform formatting, security misconfigurations and validity.
 # Needs NO Azure credentials: "init -backend=false" never touches the remote state.
-# Plan/apply with approvals is added in Milestone 5.
+# A controlled plan/apply pipeline with approvals comes in Milestone 9.
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -38,23 +38,10 @@ steps:
   - checkout: self
     clean: true
 
-  # Native fallback: Automatically locate your working local installation path and map it dynamically
-  - powershell: |
-      Write-Host "Checking local environmental paths for terraform binary..."
-      $wingetPath = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe"
-      
-      if (Test-Path "$wingetPath\terraform.exe") {
-          Write-Host "Found local winget terraform version! Injecting binary path to pipeline runtime context..."
-          Write-Host "##vso[task.prependpath]$wingetPath"
-      } else {
-          Write-Host "##vso[task.logissue type=warning]Could not map local package path manually. Attempting default system path execution..."
-      }
-    displayName: Map Local Binary Environment Paths
-
   - powershell: |
       terraform version
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform command was still not recognized in the pipeline runtime."
+        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
         exit 1
       }
     displayName: Terraform version
@@ -85,7 +72,7 @@ steps:
     displayName: Scan Terraform for misconfigurations (Trivy)
 
   - powershell: |
-      $stacks = @("shared", "envs/dev")
+      $stacks = @("shared", "envs/dev", "envs/staging", "envs/prod")
       foreach ($stack in $stacks) {
         Write-Host "=== Validating $stack ==="
         Push-Location $stack

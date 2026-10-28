@@ -1,0 +1,139 @@
+# DeployFlow CD pipeline (Milestone 5)
+#
+# Starts automatically when the CI pipeline's BuildPush stage succeeds on main.
+# It NEVER builds anything: it deploys the exact image digest that CI built, scanned and pushed.
+#
+#   Stage Staging:     deploy by digest -> smoke test -> promotion record
+#   Stage Production:  manual approval + branch check (configured on the "production"
+#                      environment) -> confirm the digest equals the one verified in staging
+#                      -> deploy -> smoke test -> promotion record
+#
+# Never runs for pull requests.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci
+      source: deployflow-ci
+      trigger:
+        branches:
+          include:
+            - main
+        stages:
+          - BuildPush
+
+parameters:
+  - name: smokeMaxP95Ms
+    displayName: Smoke test - maximum 95th percentile latency (ms)
+    type: number
+    default: 1500
+
+pool:
+  name: deployflow-laptop-pool
+
+variables:
+  - name: azureServiceConnection
+    value: sc-azure-deployflow
+  - name: stagingApp
+    value: ca-deployflow-staging
+  - name: stagingResourceGroup
+    value: rg-deployflow-staging-eus2
+  - name: prodApp
+    value: ca-deployflow-prod
+  - name: prodResourceGroup
+    value: rg-deployflow-prod-eus2
+
+stages:
+  # ---------------------------------------------------------------------------
+  # Stage 1: staging
+  # ---------------------------------------------------------------------------
+  - stage: Staging
+    displayName: Deploy and verify in staging
+    jobs:
+      - deployment: DeployStaging
+        displayName: Deploy to staging
+        environment: staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - download: ci
+                  artifact: release-evidence
+                  displayName: Download release evidence from CI
+
+                - task: AzureCLI@2
+                  displayName: Deploy the CI image (by digest) to staging
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\deploy-containerapp.ps1
+                    arguments: -AppName $(stagingApp) -ResourceGroup $(stagingResourceGroup) -EnvironmentName staging -MetadataPath "$(Pipeline.Workspace)\ci\release-evidence\release-metadata.json" -RevisionSuffix "b$(Build.BuildId)-a$(System.StageAttempt)" -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-staging.json" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
+
+                - powershell: |
+                    & "$(Build.SourcesDirectory)\scripts\smoke-test.ps1" -BaseUrl "$(appUrl)" -ExpectedSha "$(shortSha)" -ExpectedEnvironment "staging" -MaxP95Ms ${{ parameters.smokeMaxP95Ms }} -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\smoke-staging.json"
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
+                  workingDirectory: $(Build.SourcesDirectory)
+                  displayName: Smoke test staging
+
+                - publish: $(Build.ArtifactStagingDirectory)/promotion
+                  artifact: promotion-staging
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  displayName: Publish staging promotion record
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: production. Waits for approval (set on the "production" environment).
+  # ---------------------------------------------------------------------------
+  - stage: Production
+    displayName: Promote to production
+    dependsOn: Staging
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProduction
+        displayName: Deploy to production
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - download: ci
+                  artifact: release-evidence
+                  displayName: Download release evidence from CI
+
+                - download: current
+                  artifact: promotion-staging
+                  displayName: Download the staging promotion record
+
+                - task: AzureCLI@2
+                  displayName: Deploy the SAME digest to production
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\deploy-containerapp.ps1
+                    arguments: -AppName $(prodApp) -ResourceGroup $(prodResourceGroup) -EnvironmentName production -MetadataPath "$(Pipeline.Workspace)\ci\release-evidence\release-metadata.json" -RequiredRecordPath "$(Pipeline.Workspace)\promotion-staging\promotion-staging.json" -RevisionSuffix "b$(Build.BuildId)-a$(System.StageAttempt)" -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-production.json" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
+
+                - powershell: |
+                    & "$(Build.SourcesDirectory)\scripts\smoke-test.ps1" -BaseUrl "$(appUrl)" -ExpectedSha "$(shortSha)" -ExpectedEnvironment "prod" -MaxP95Ms ${{ parameters.smokeMaxP95Ms }} -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\smoke-production.json"
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
+                  workingDirectory: $(Build.SourcesDirectory)
+                  displayName: Smoke test production
+
+                - publish: $(Build.ArtifactStagingDirectory)/promotion
+                  artifact: promotion-production
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  displayName: Publish production promotion record
