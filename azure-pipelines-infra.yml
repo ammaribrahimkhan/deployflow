@@ -39,6 +39,7 @@ steps:
     clean: true
 
   - powershell: |
+      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
       terraform version
       if ($LASTEXITCODE -ne 0) {
         Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
@@ -47,6 +48,7 @@ steps:
     displayName: Terraform version
 
   - powershell: |
+      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
       terraform fmt -check -recursive -diff
       if ($LASTEXITCODE -ne 0) {
         Write-Host "##vso[task.logissue type=error]Formatting problems found. Run: terraform fmt -recursive"
@@ -56,6 +58,7 @@ steps:
     displayName: Terraform format check
 
   - powershell: |
+      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
       Write-Host "=== Informational: HIGH and CRITICAL findings (do not block) ==="
       & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("config", "--severity", "HIGH,CRITICAL", "--exit-code", "0", "infra")
       if ($LASTEXITCODE -ne 0) {
@@ -72,6 +75,7 @@ steps:
     displayName: Scan Terraform for misconfigurations (Trivy)
 
   - powershell: |
+      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
       $stacks = @("shared", "envs/dev", "envs/staging", "envs/prod")
       foreach ($stack in $stacks) {
         Write-Host "=== Validating $stack ==="
