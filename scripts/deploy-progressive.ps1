@@ -1,4 +1,3 @@
-
 # DeployFlow progressive production deployment with baseline-aware canary checks.
 param(
   [Parameter(Mandatory = $true)] [string]$AppName,
@@ -18,7 +17,9 @@ param(
   [int]$CanaryMaxP95Ms = 1500,
   [double]$MaxLatencyIncreasePercent = 50,
   [int]$InjectFaultPercent = 0,
-  [string]$ForceRedeploy = "false"
+  [string]$ForceRedeploy = "false",
+  [int]$WarmupSeconds = 120,
+  [int]$BaselineAttempts = 3
 )
 
 $here = $PSScriptRoot
@@ -33,6 +34,7 @@ function Invoke-Probe($url) {
   $watch = [System.Diagnostics.Stopwatch]::StartNew()
   $ok = $false
   $revision = $null
+  $errorText = ""
 
   try {
     $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
@@ -41,8 +43,12 @@ function Invoke-Probe($url) {
       try {
         $revision = ($response.Content | ConvertFrom-Json).revision
       } catch {}
+    } else {
+      $errorText = "HTTP $($response.StatusCode)"
     }
-  } catch {}
+  } catch {
+    $errorText = $_.Exception.Message
+  }
 
   $watch.Stop()
 
@@ -50,6 +56,7 @@ function Invoke-Probe($url) {
     Ok = $ok
     Ms = [int]$watch.ElapsedMilliseconds
     Revision = $revision
+    Error = $errorText
   }
 }
 
@@ -113,6 +120,28 @@ function Restore-Traffic {
   }
 
   return ($restoreOk -and [bool]$check)
+}
+
+# Wakes a scaled-to-zero app and waits until it answers several times in a row.
+function Wait-ForWarm($url, $maxSeconds) {
+  $deadline = (Get-Date).AddSeconds($maxSeconds)
+  $streak = 0
+
+  while ((Get-Date) -lt $deadline) {
+    $probe = Invoke-Probe $url
+
+    if ($probe.Ok) {
+      $streak++
+      if ($streak -ge 3) { return $true }
+      Start-Sleep -Milliseconds 500
+    } else {
+      $streak = 0
+      Write-Host "Warm-up probe failed: $($probe.Error)"
+      Start-Sleep -Seconds 3
+    }
+  }
+
+  return $false
 }
 
 function Measure-Endpoint($url, $count) {
@@ -269,20 +298,47 @@ if (($oldImage -eq $imageRef) -and (-not $force)) {
   Finish "already_live" 0 "This image is already live. Nothing to deploy."
 }
 
-# 3. Measure the existing production baseline BEFORE changing traffic.
+# 3. Warm up production, then measure the baseline BEFORE changing traffic.
+Write-Host ""
+Write-Host "=== Warming up production (it may be scaled to zero) ==="
+
+if (-not (Wait-ForWarm $mainUrl $WarmupSeconds)) {
+  Fail "Production did not respond successfully within $WarmupSeconds seconds. Check the app and the agent's internet connection. Production was not changed."
+}
+
+Write-Host "Production is warm."
 Write-Host ""
 Write-Host "=== Measuring existing production baseline ==="
 
-$baseline = Measure-Endpoint $mainUrl $ProbesPerStep
+$baseline = $null
 
-if ($baseline.Errors -gt 0) {
-  Fail "Existing production baseline has $($baseline.Errors) failed probes. Fix production health before starting a canary."
+for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
+  $baseline = Measure-Endpoint $mainUrl $ProbesPerStep
+
+  Write-Host "Baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
+
+  if ($baseline.ErrorPercent -le $MaxErrorRatePercent) { break }
+
+  foreach ($failedProbe in @($baseline.Results | Where-Object { -not $_.Ok } | Select-Object -First 3)) {
+    Write-Host "  Failed probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
+  }
+
+  if ($attempt -lt $BaselineAttempts) {
+    Write-Host "Baseline error rate is above $MaxErrorRatePercent%. Waiting 15 seconds and measuring again..."
+    Start-Sleep -Seconds 15
+  }
 }
 
-$baselineP95 = $baseline.P95
+if ($baseline.ErrorPercent -gt $MaxErrorRatePercent) {
+  Fail "Existing production baseline stayed above $MaxErrorRatePercent% errors after $BaselineAttempts attempts (last: $($baseline.Errors) of $($baseline.Count) probes failed). Fix production health before starting a canary."
+}
+
+# The baseline latency uses successful probes only, so one timeout cannot distort it.
+$okLatencies = @($baseline.Results | Where-Object { $_.Ok } | ForEach-Object { $_.Ms })
+$baselineP95 = Get-P95 $okLatencies
 $record.baselineP95Ms = $baselineP95
 
-Write-Host "Production baseline: $($baseline.Count) probes, p95 $baselineP95 ms"
+Write-Host "Production baseline: $($okLatencies.Count) successful probes, p95 $baselineP95 ms"
 
 # 4. Keep the known-good revision at 100%, then create candidate.
 az containerapp ingress traffic set --name $AppName --resource-group $ResourceGroup --revision-weight "$old=100" --output none
