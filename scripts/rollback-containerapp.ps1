@@ -23,6 +23,16 @@ function Fail($message) {
   exit 1
 }
 
+# Windows PowerShell 5.1 returns a JSON array from ConvertFrom-Json as ONE nested object.
+# This helper unpacks it so every revision is a separate item.
+function Flatten($items) {
+  foreach ($outer in $items) {
+    foreach ($inner in $outer) {
+      $inner
+    }
+  }
+}
+
 function Write-Record($record) {
   $folder = Split-Path -Parent $OutputPath
   if ($folder -and -not (Test-Path $folder)) { New-Item -ItemType Directory -Force -Path $folder | Out-Null }
@@ -33,7 +43,7 @@ function Write-Record($record) {
 # 1. What exists?
 $revText = (az containerapp revision list --name $AppName --resource-group $ResourceGroup --query "[].{name:name, active:properties.active, created:properties.createdTime, traffic:properties.trafficWeight, image:properties.template.containers[0].image}" -o json | Out-String)
 if ($LASTEXITCODE -ne 0) { Fail "Could not list the revisions of $AppName" }
-$revisions = @(ConvertFrom-Json $revText)
+$revisions = @(Flatten (ConvertFrom-Json $revText))
 if ($revisions.Count -eq 0) { Fail "No revisions found for $AppName" }
 
 $sorted = @($revisions | Sort-Object -Property created -Descending)
@@ -44,7 +54,7 @@ $fqdn = (az containerapp show --name $AppName --resource-group $ResourceGroup --
 Write-Host "##vso[task.setvariable variable=appUrl]https://$fqdn"
 
 # 2. Which revision serves the traffic now?
-$current = $revisions | Sort-Object -Property @{ Expression = "traffic"; Descending = $true }, @{ Expression = "created"; Descending = $true } | Select-Object -First 1
+$current = @($revisions | Sort-Object -Property @{ Expression = "traffic"; Descending = $true }, @{ Expression = "created"; Descending = $true }) | Select-Object -First 1
 Write-Host "Currently serving: $($current.name) ($($current.traffic)%)"
 
 # 3. Which revision do we go back to?
@@ -93,8 +103,8 @@ if ($LASTEXITCODE -ne 0) { Fail "Could not change the traffic" }
 
 # 6. Confirm, then deactivate the revision we rolled away from.
 $trafficText = (az containerapp ingress traffic show --name $AppName --resource-group $ResourceGroup -o json | Out-String)
-$trafficItems = ConvertFrom-Json $trafficText
-$confirmed = @($trafficItems) | Where-Object { $_.revisionName -eq $target.name -and $_.weight -eq 100 }
+$trafficItems = @(Flatten (ConvertFrom-Json $trafficText))
+$confirmed = $trafficItems | Where-Object { $_.revisionName -eq $target.name -and $_.weight -eq 100 }
 if (-not $confirmed) { Fail "Traffic change could not be confirmed. Check the Revisions page in the Portal." }
 
 if ($current.name -ne $target.name) {
