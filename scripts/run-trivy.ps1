@@ -22,12 +22,14 @@ if ($TrivyImage -like "*REPLACE_WITH_DIGEST*") {
   exit 1
 }
 
-$cacheDir = "C:\trivy-cache"
-if (-not (Test-Path $cacheDir)) {
-  New-Item -ItemType Directory -Path $cacheDir | Out-Null
-}
+# Construct the core docker arguments using a dedicated Docker named volume for the cache
+$dockerArgs = @(
+  "run", "--rm", 
+  "-v", "deployflow-trivy-cache:/root/.cache/", 
+  "-v", "${SourceDir}:/work", 
+  "-w", "/work"
+)
 
-$dockerArgs = @("run", "--rm", "-v", "${cacheDir}:/root/.cache/", "-v", "${SourceDir}:/work", "-w", "/work")
 if ($InputDir) { $dockerArgs += @("-v", "${InputDir}:/in") }
 if ($OutDir) { $dockerArgs += @("-v", "${OutDir}:/out") }
 $dockerArgs += $TrivyImage

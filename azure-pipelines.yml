@@ -63,13 +63,29 @@ stages:
           - checkout: self
             clean: true
 
-          - powershell: |
-              & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("fs", "--scanners", "vuln,secret", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1", "--skip-dirs", "**/.venv", "--skip-dirs", "**/.terraform", "--skip-dirs", ".git", ".")
-              if ($LASTEXITCODE -ne 0) {
-                Write-Host "##vso[task.logissue type=error]Source scan failed: HIGH/CRITICAL vulnerability or secret found (or Trivy could not run). Read the log above."
-                exit 1
-              }
-            displayName: Scan source for secrets and vulnerable dependencies (Trivy)
+- powershell: |
+    & .\scripts\run-trivy.ps1 `
+      -TrivyImage "$(trivyImage)" `
+      -SourceDir "$(Build.SourcesDirectory)" `
+      -TrivyArgs @(
+        "fs",
+        "--timeout", "20m",
+        "--scanners", "vuln,secret",
+        "--severity", "HIGH,CRITICAL",
+        "--ignore-unfixed",
+        "--exit-code", "1",
+        "--skip-dirs", "**/.venv",
+        "--skip-dirs", "**/.terraform",
+        "--skip-dirs", ".git",
+        "."
+      )
+
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "##vso[task.logissue type=error]Trivy source scan failed."
+      exit 1
+    }
+  displayName: Scan source for secrets and vulnerable dependencies (Trivy)
+  timeoutInMinutes: 30
 
           - powershell: |
               py --version
