@@ -26,7 +26,7 @@ resource "azurerm_container_app" "this" {
   resource_group_name          = var.resource_group_name
   container_app_environment_id = var.container_app_environment_id
 
-  # "Multiple" lets two revisions run side by side (needed for traffic splitting in Milestone 6).
+  # "Multiple" lets two revisions run side by side (needed for traffic splitting).
   revision_mode = "Multiple"
   tags          = var.tags
 
@@ -88,11 +88,14 @@ resource "azurerm_container_app" "this" {
     }
   }
 
-  # Terraform creates the app. The pipeline deploys new images later,
-  # so Terraform must not undo those deployments.
+  # Terraform creates the app. The release pipelines own everything that changes
+  # at release time: the image, release-time environment variables and the traffic
+  # split between revisions. Terraform must not undo those.
   lifecycle {
     ignore_changes = [
       template[0].container[0].image,
+      template[0].container[0].env,
+      ingress[0].traffic_weight,
     ]
   }
 

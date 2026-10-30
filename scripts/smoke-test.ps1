@@ -3,14 +3,14 @@ Smoke test for a deployed DeployFlow app.
 
 Checks, in order:
   1. /health reports "healthy" (retries while the app starts or scales up from zero)
-  2. /api/info shows the expected commit (short SHA) and environment name
+  2. /api/info shows the expected environment name, and the expected commit when -ExpectedSha is given
   3. A burst of requests: every request succeeds and the 95th percentile latency is within the limit
 
 Writes a JSON result file (optional). Exit code 0 = pass, 1 = fail.
 #>
 param(
   [Parameter(Mandatory = $true)] [string]$BaseUrl,
-  [Parameter(Mandatory = $true)] [string]$ExpectedSha,
+  [string]$ExpectedSha = "",
   [Parameter(Mandatory = $true)] [string]$ExpectedEnvironment,
   [int]$WarmupSeconds = 180,
   [int]$Requests = 20,
@@ -43,7 +43,7 @@ while ((Get-Date) -lt $deadline) {
   Start-Sleep -Seconds 3
 }
 
-# 2. Right commit and right environment?
+# 2. Right environment, and right commit when one is expected.
 $reportedSha = $null
 $reportedEnvironment = $null
 if ($healthy) {
@@ -52,7 +52,7 @@ if ($healthy) {
     $info = Get-Json "$BaseUrl/api/info"
     $reportedSha = $info.gitSha
     $reportedEnvironment = $info.environment
-    if ($reportedSha -ne $ExpectedSha) {
+    if ($ExpectedSha -and ($reportedSha -ne $ExpectedSha)) {
       $failures += "Wrong commit: the app reports '$reportedSha' but '$ExpectedSha' was expected"
     }
     if ($reportedEnvironment -ne $ExpectedEnvironment) {

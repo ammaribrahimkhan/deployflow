@@ -2,10 +2,12 @@
 
 The pipeline injects release metadata (APP_VERSION, GIT_SHA, APP_ENV) so that
 every log line and API response can be traced back to a specific commit.
+Azure Container Apps adds CONTAINER_APP_REVISION, which says which revision answered.
 """
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,7 +34,19 @@ def release_info():
         "version": os.environ.get("APP_VERSION", "dev"),
         "gitSha": os.environ.get("GIT_SHA", "local"),
         "environment": os.environ.get("APP_ENV", "local"),
+        "revision": os.environ.get("CONTAINER_APP_REVISION", "local"),
     }
+
+
+def fault_percent():
+    """Demo hook (chaos testing): percentage of requests to "/" that fail on purpose.
+
+    0 (the default) means disabled. Only the release pipeline's demo switch sets it.
+    """
+    try:
+        return float(os.environ.get("FAULT_INJECTION_PERCENT", "0"))
+    except ValueError:
+        return 0.0
 
 
 @app.before_request
@@ -61,6 +75,9 @@ def log_request(response):
 
 @app.get("/")
 def index():
+    percent = fault_percent()
+    if percent > 0 and random.uniform(0, 100) < percent:  # nosec B311 - demo hook, not security related
+        return jsonify(error="Injected fault (demo hook)"), 500
     return jsonify(
         service="deployflow-app",
         message="Hello from DeployFlow!",
@@ -70,7 +87,7 @@ def index():
 
 @app.get("/health")
 def health():
-    """Used by Azure probes, smoke tests and the dashboard."""
+    """Used by Azure probes, smoke tests and the dashboard. Never affected by the fault hook."""
     uptime = (datetime.now(timezone.utc) - STARTED_AT).total_seconds()
     return jsonify(
         status="healthy",

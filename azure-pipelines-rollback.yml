@@ -1,0 +1,71 @@
+# DeployFlow rollback pipeline (Milestone 6)
+#
+# Manual only. Sends 100% of the production traffic back to an earlier revision.
+# Runs against the "production" environment, so it needs the same approval and branch check
+# as a release. Safe to run more than once (idempotent).
+#
+# Parameters (shown in the "Run pipeline" form):
+#   targetRevision : leave empty to go back to the previous revision
+#   reason         : short text stored in the rollback record (no quote characters please)
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: targetRevision
+    displayName: Revision to roll back to (empty = the previous revision)
+    type: string
+    default: ''
+  - name: reason
+    displayName: Reason for the rollback (no quote characters)
+    type: string
+    default: manual rollback
+
+pool:
+  name: deployflow-laptop-pool
+
+variables:
+  - name: azureServiceConnection
+    value: sc-azure-deployflow
+  - name: prodApp
+    value: ca-deployflow-prod
+  - name: prodResourceGroup
+    value: rg-deployflow-prod-eus2
+
+stages:
+  - stage: Rollback
+    displayName: Roll back production
+    jobs:
+      - deployment: RollbackProduction
+        displayName: Roll back production
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - task: AzureCLI@2
+                  displayName: Restore the previous revision
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\rollback-containerapp.ps1
+                    arguments: -AppName $(prodApp) -ResourceGroup $(prodResourceGroup) -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json" -TargetRevision "${{ parameters.targetRevision }}" -Reason "${{ parameters.reason }}" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
+
+                - powershell: |
+                    & "$(Build.SourcesDirectory)\scripts\smoke-test.ps1" -BaseUrl "$(appUrl)" -ExpectedSha "" -ExpectedEnvironment "prod" -MaxP95Ms 5000 -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\smoke-after-rollback.json"
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
+                  workingDirectory: $(Build.SourcesDirectory)
+                  displayName: Smoke test production after the rollback
+
+                - publish: $(Build.ArtifactStagingDirectory)/rollback
+                  artifact: rollback-record
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  displayName: Publish the rollback record
