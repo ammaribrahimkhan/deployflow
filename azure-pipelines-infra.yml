@@ -76,17 +76,34 @@ steps:
 
   - powershell: |
       $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
+
+      # Shared provider cache: azurerm is downloaded once and reused by every stack and every run
+      $cache = "C:\agent\terraform-plugin-cache"
+      New-Item -ItemType Directory -Force -Path $cache | Out-Null
+      $env:TF_PLUGIN_CACHE_DIR = $cache
+
       $stacks = @("shared", "envs/dev", "envs/staging", "envs/prod")
       foreach ($stack in $stacks) {
         Write-Host "=== Validating $stack ==="
         Push-Location $stack
-        terraform init -backend=false -input=false
-        if ($LASTEXITCODE -ne 0) {
-          Write-Host "##vso[task.logissue type=error]terraform init failed in $stack"
+
+        # Retry init: the provider download can time out on a weak connection
+        $initOk = $false
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+          terraform init -backend=false -input=false
+          if ($LASTEXITCODE -eq 0) { $initOk = $true; break }
+          Write-Host "terraform init attempt $attempt failed. Retrying in $($attempt * 15) seconds..."
+          Start-Sleep -Seconds ($attempt * 15)
+        }
+        if (-not $initOk) {
+          Pop-Location
+          Write-Host "##vso[task.logissue type=error]terraform init failed in $stack after 5 attempts"
           exit 1
         }
+
         terraform validate
         if ($LASTEXITCODE -ne 0) {
+          Pop-Location
           Write-Host "##vso[task.logissue type=error]terraform validate failed in $stack"
           exit 1
         }
