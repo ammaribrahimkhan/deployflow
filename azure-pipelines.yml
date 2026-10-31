@@ -1,3 +1,4 @@
+
 # DeployFlow CI Pipeline - Milestone 4
 # Security gates, Docker build, smoke test, image scan, SBOM and ACR push.
 #
@@ -514,6 +515,7 @@ stages:
 
         - task: AzureCLI@2
           displayName: Push scanned image to ACR and write release metadata
+          retryCountOnTaskFailure: 2
 
           inputs:
             azureSubscription: $(azureServiceConnection)

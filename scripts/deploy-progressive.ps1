@@ -1,7 +1,7 @@
 
-# DeployFlow progressive production deployment with baseline-aware canary checks.
-# A live latency breach is confirmed with a second independent probe batch
-# before rollback. Error-rate and candidate latency gates remain strict.
+# DeployFlow progressive production deployment.
+# Uses reusable HTTP connections, paired endpoint measurements,
+# baseline-aware latency gates, and independent live latency confirmation.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -43,6 +43,16 @@ $here = $PSScriptRoot
 $force = ($ForceRedeploy -eq "true")
 
 # ------------------------------------------------------------
+# SHARED HTTP CLIENT
+# ------------------------------------------------------------
+
+Add-Type -AssemblyName System.Net.Http
+
+$httpHandler = New-Object System.Net.Http.HttpClientHandler
+$script:DeployFlowHttpClient = New-Object System.Net.Http.HttpClient($httpHandler)
+$script:DeployFlowHttpClient.Timeout = [TimeSpan]::FromSeconds(10)
+
+# ------------------------------------------------------------
 # COMMON FUNCTIONS
 # ------------------------------------------------------------
 
@@ -52,23 +62,22 @@ function Fail($message) {
 }
 
 function Invoke-Probe($url) {
-
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $ok = $false
     $revision = $null
     $errorText = ""
+    $response = $null
 
     try {
-        $response = Invoke-WebRequest `
-            -Uri $url `
-            -UseBasicParsing `
-            -TimeoutSec 10
+        $response = $script:DeployFlowHttpClient.GetAsync($url).GetAwaiter().GetResult()
 
-        if ($response.StatusCode -eq 200) {
+        if ([int]$response.StatusCode -eq 200) {
             $ok = $true
 
+            $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
             try {
-                $revision = ($response.Content | ConvertFrom-Json).revision
+                $revision = ($content | ConvertFrom-Json).revision
             }
             catch {
                 # Root endpoint may return HTML.
@@ -76,11 +85,16 @@ function Invoke-Probe($url) {
             }
         }
         else {
-            $errorText = "HTTP $($response.StatusCode)"
+            $errorText = "HTTP $([int]$response.StatusCode)"
         }
     }
     catch {
         $errorText = $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
     }
 
     $watch.Stop()
@@ -94,7 +108,6 @@ function Invoke-Probe($url) {
 }
 
 function Get-P95($values) {
-
     $sorted = @($values | Sort-Object)
 
     if ($sorted.Count -eq 0) {
@@ -106,8 +119,66 @@ function Get-P95($values) {
     return [int]$sorted[$index]
 }
 
-function Get-Traffic {
+function Convert-ProbeResults($results) {
+    $errors = @($results | Where-Object { -not $_.Ok }).Count
 
+    $errorPercent = [math]::Round(
+        100.0 * $errors / $results.Count,
+        1
+    )
+
+    $p95 = Get-P95 (
+        $results |
+        Where-Object { $_.Ok } |
+        ForEach-Object { $_.Ms }
+    )
+
+    return [pscustomobject]@{
+        Results      = $results
+        Errors       = $errors
+        ErrorPercent = $errorPercent
+        P95          = $p95
+        Count        = $results.Count
+    }
+}
+
+function Measure-Endpoint($url, $count) {
+    $results = @()
+
+    for ($i = 1; $i -le $count; $i++) {
+        $results += Invoke-Probe $url
+        Start-Sleep -Milliseconds 250
+    }
+
+    return Convert-ProbeResults $results
+}
+
+function Measure-PairedEndpoints($mainUrl, $candidateUrl, $count) {
+    $mainResults = @()
+    $candidateResults = @()
+
+    for ($i = 1; $i -le $count; $i++) {
+        # Alternate which endpoint is measured first to reduce
+        # systematic timing bias between the two batches.
+        if (($i % 2) -eq 1) {
+            $mainResults += Invoke-Probe $mainUrl
+            $candidateResults += Invoke-Probe $candidateUrl
+        }
+        else {
+            $candidateResults += Invoke-Probe $candidateUrl
+            $mainResults += Invoke-Probe $mainUrl
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    return [pscustomobject]@{
+        Main      = Convert-ProbeResults $mainResults
+        Candidate = Convert-ProbeResults $candidateResults
+    }
+}
+
+function Get-Traffic {
     $text = & az containerapp ingress traffic show `
         --name $AppName `
         --resource-group $ResourceGroup `
@@ -126,7 +197,6 @@ function Get-Traffic {
 }
 
 function Deactivate-Revision($name) {
-
     if ([string]::IsNullOrWhiteSpace($name)) {
         return
     }
@@ -143,7 +213,6 @@ function Deactivate-Revision($name) {
 }
 
 function Finish($outcome, $exitCode, $message) {
-
     $record.outcome = $outcome
     $record.message = $message
     $record.steps = $stepResults
@@ -182,11 +251,13 @@ function Finish($outcome, $exitCode, $message) {
         Write-Host $message
     }
 
+    $script:DeployFlowHttpClient.Dispose()
+    $httpHandler.Dispose()
+
     exit $exitCode
 }
 
 function Restore-Traffic {
-
     Write-Host "Restoring 100% traffic to known-good revision $old."
 
     & az containerapp ingress traffic set `
@@ -210,16 +281,13 @@ function Restore-Traffic {
 
 # Wakes a scaled-to-zero app and waits for three consecutive successful probes.
 function Wait-ForWarm($url, $maxSeconds) {
-
     $deadline = (Get-Date).AddSeconds($maxSeconds)
     $streak = 0
 
     while ((Get-Date) -lt $deadline) {
-
         $probe = Invoke-Probe $url
 
         if ($probe.Ok) {
-
             $streak++
 
             if ($streak -ge 3) {
@@ -229,7 +297,6 @@ function Wait-ForWarm($url, $maxSeconds) {
             Start-Sleep -Milliseconds 500
         }
         else {
-
             $streak = 0
 
             Write-Host "Warm-up probe failed: $($probe.Error)"
@@ -239,41 +306,6 @@ function Wait-ForWarm($url, $maxSeconds) {
     }
 
     return $false
-}
-
-function Measure-Endpoint($url, $count) {
-
-    $results = @()
-
-    for ($i = 1; $i -le $count; $i++) {
-
-        $results += Invoke-Probe $url
-
-        Start-Sleep -Milliseconds 250
-    }
-
-    $errors = @(
-        $results | Where-Object { -not $_.Ok }
-    ).Count
-
-    $errorPercent = [math]::Round(
-        100.0 * $errors / $results.Count,
-        1
-    )
-
-    $p95 = Get-P95 (
-        $results |
-        Where-Object { $_.Ok } |
-        ForEach-Object { $_.Ms }
-    )
-
-    return [pscustomobject]@{
-        Results      = $results
-        Errors       = $errors
-        ErrorPercent = $errorPercent
-        P95          = $p95
-        Count        = $results.Count
-    }
 }
 
 # ------------------------------------------------------------
@@ -334,7 +366,6 @@ if ($stepList[-1] -ne 100) {
 $previousWeight = 0
 
 foreach ($weight in $stepList) {
-
     if ($weight -lt 1 -or $weight -gt 100) {
         Fail "Traffic steps must be between 1 and 100."
     }
@@ -349,6 +380,8 @@ foreach ($weight in $stepList) {
 Write-Host "Traffic rollout steps: $($stepList -join ', ')"
 Write-Host "Observation period: $ObserveSeconds seconds"
 Write-Host "Probes per step: $ProbesPerStep"
+Write-Host "HTTP connection reuse enabled."
+Write-Host "Candidate latency gate uses the production baseline."
 
 # ------------------------------------------------------------
 # 2. VALIDATE RELEASE METADATA
@@ -390,7 +423,6 @@ if (-not $meta.shortSha -or -not $meta.gitSha) {
 # ------------------------------------------------------------
 
 if (-not [string]::IsNullOrWhiteSpace($RequiredRecordPath)) {
-
     if (-not (Test-Path -LiteralPath $RequiredRecordPath)) {
         Fail "Staging promotion record not found: $RequiredRecordPath"
     }
@@ -457,35 +489,37 @@ if (-not (Test-Path -LiteralPath $outDir)) {
 $stepResults = @()
 
 $record = [ordered]@{
-    environment               = $EnvironmentName
-    appName                   = $AppName
-    resourceGroup             = $ResourceGroup
-    imageReference            = $imageRef
-    imageDigest               = $digest
-    shortSha                  = $meta.shortSha
-    gitSha                    = $meta.gitSha
-    appVersion                = $meta.appVersion
-    sourceBuildId             = $meta.buildId
-    sourcePipelineRunUrl      = $meta.pipelineRunUrl
-    strategy                  = "progressive: $Steps"
-    observeSeconds            = $ObserveSeconds
-    probesPerStep             = $ProbesPerStep
-    injectFaultPercent        = $InjectFaultPercent
-    forceRedeploy             = $force
-    baselineP95Ms             = $null
-    maxLatencyIncreasePercent = $MaxLatencyIncreasePercent
-    latencyConfirmationEnabled = $true
+    environment                    = $EnvironmentName
+    appName                        = $AppName
+    resourceGroup                  = $ResourceGroup
+    imageReference                 = $imageRef
+    imageDigest                    = $digest
+    shortSha                       = $meta.shortSha
+    gitSha                         = $meta.gitSha
+    appVersion                     = $meta.appVersion
+    sourceBuildId                  = $meta.buildId
+    sourcePipelineRunUrl           = $meta.pipelineRunUrl
+    strategy                       = "progressive: $Steps"
+    observeSeconds                 = $ObserveSeconds
+    probesPerStep                  = $ProbesPerStep
+    injectFaultPercent             = $InjectFaultPercent
+    forceRedeploy                  = $force
+    baselineP95Ms                  = $null
+    maxLatencyIncreasePercent      = $MaxLatencyIncreasePercent
+    latencyConfirmationEnabled     = $true
     latencyConfirmationDelaySeconds = 10
-    outcome                   = "started"
-    message                   = ""
-    previousRevision          = $null
-    previousImage             = $null
-    candidateRevision         = $null
-    steps                     = @()
-    finalTraffic              = @()
-    startedAtUtc              = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    finishedAtUtc             = $null
-    deploymentRunUrl          = $RunUrl
+    measurementMethod              = "shared_http_client_alternating_endpoint_probes"
+    candidateLatencyGate           = "baseline_aware"
+    outcome                        = "started"
+    message                        = ""
+    previousRevision               = $null
+    previousImage                  = $null
+    candidateRevision              = $null
+    steps                          = @()
+    finalTraffic                   = @()
+    startedAtUtc                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    finishedAtUtc                  = $null
+    deploymentRunUrl               = $RunUrl
 }
 
 # ------------------------------------------------------------
@@ -559,9 +593,7 @@ Write-Host "Release image: $imageRef"
 # ------------------------------------------------------------
 
 if (($oldImage -eq $imageRef) -and (-not $force)) {
-
     $record.candidateRevision = $old
-
     Finish "already_live" 0 "This exact image is already live. Nothing to deploy."
 }
 
@@ -584,7 +616,6 @@ Write-Host "=== Measuring existing production baseline ==="
 $baseline = $null
 
 for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
-
     $baseline = Measure-Endpoint $mainUrl $ProbesPerStep
 
     Write-Host "Baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
@@ -703,11 +734,9 @@ Write-Host "=== Candidate pre-traffic smoke test ==="
     -ExpectedEnvironment $ExpectedEnvironment `
     -MaxP95Ms $PreTrafficMaxP95Ms `
     -OutputPath (Join-Path $outDir "smoke-candidate-production.json")
-
 $smokeSucceeded = $?
 
 if (-not $smokeSucceeded) {
-
     Deactivate-Revision $new
 
     Finish `
@@ -725,7 +754,6 @@ Write-Host "Candidate pre-traffic smoke test passed."
 $stepNumber = 0
 
 foreach ($weight in $stepList) {
-
     $stepNumber++
 
     Write-Host ""
@@ -752,7 +780,6 @@ foreach ($weight in $stepList) {
         --output none
 
     if ($LASTEXITCODE -ne 0) {
-
         $restored = Restore-Traffic
 
         if (-not $restored) {
@@ -772,9 +799,11 @@ foreach ($weight in $stepList) {
         $null = Invoke-Probe "$candUrl/"
     }
 
-    # Measure live production and candidate directly.
-    $main = Measure-Endpoint $mainUrl $ProbesPerStep
-    $candidate = Measure-Endpoint $candUrl $ProbesPerStep
+    # Alternate live and candidate probes to reduce measurement-order bias.
+    $paired = Measure-PairedEndpoints $mainUrl $candUrl $ProbesPerStep
+
+    $main = $paired.Main
+    $candidate = $paired.Candidate
 
     $mainP95 = $main.P95
     $candP95 = $candidate.P95
@@ -792,7 +821,7 @@ foreach ($weight in $stepList) {
     )
 
     Write-Host "Baseline p95: $baselineP95 ms"
-    Write-Host "Effective live p95 limit: $effectiveLiveLimit ms"
+    Write-Host "Effective live and candidate p95 limit: $effectiveLiveLimit ms"
 
     Write-Host "Live endpoint: $($main.Count) probes, $($main.Errors) errors ($mainErrorPercent%), p95 $mainP95 ms"
 
@@ -819,16 +848,12 @@ foreach ($weight in $stepList) {
 
     # Confirm a live latency breach using a separate probe batch.
     if ($mainP95 -gt $effectiveLiveLimit) {
-
         if ($mainErrorPercent -gt $MaxErrorRatePercent) {
-
             $mainLatencyConfirmationResult = "skipped_live_errors"
 
             $breaches += "Live latency exceeded its limit and the live error rate also breached its limit."
-
         }
         else {
-
             Write-Host ""
             Write-Host "WARNING: Live p95 exceeded its limit."
             Write-Host "Waiting 10 seconds before independent confirmation."
@@ -843,21 +868,16 @@ foreach ($weight in $stepList) {
             Write-Host "Latency confirmation: $($confirmation.Count) probes, $($confirmation.Errors) errors ($($confirmation.ErrorPercent)%), p95 $($confirmation.P95) ms"
 
             if ($confirmation.ErrorPercent -gt $MaxErrorRatePercent) {
-
                 $mainLatencyConfirmationResult = "failed_errors"
 
                 $breaches += "Latency confirmation error rate $($confirmation.ErrorPercent)% exceeds $MaxErrorRatePercent%."
-
             }
             elseif ($confirmation.P95 -gt $effectiveLiveLimit) {
-
                 $mainLatencyConfirmationResult = "confirmed_breach"
 
                 $breaches += "Live p95 breach confirmed: first batch $mainP95 ms and confirmation $($confirmation.P95) ms both exceed $effectiveLiveLimit ms."
-
             }
             else {
-
                 $mainLatencyConfirmationResult = "passed"
 
                 Write-Host "Latency confirmation passed. Treating the first high-p95 measurement as a transient spike."
@@ -865,8 +885,9 @@ foreach ($weight in $stepList) {
         }
     }
 
-    if ($candP95 -gt $CanaryMaxP95Ms) {
-        $breaches += "Candidate p95 $candP95 ms exceeds $CanaryMaxP95Ms ms."
+    # Candidate latency breaches are immediate and use the same baseline-aware limit.
+    if ($candP95 -gt $effectiveLiveLimit) {
+        $breaches += "Candidate p95 $candP95 ms exceeds baseline-aware limit $effectiveLiveLimit ms."
     }
 
     $resultText = "pass"
@@ -876,25 +897,25 @@ foreach ($weight in $stepList) {
     }
 
     $stepResults += [ordered]@{
-        step                           = $stepNumber
-        trafficToCandidatePercent      = $weight
-        baselineP95Ms                  = $baselineP95
-        effectiveLiveLimitMs           = $effectiveLiveLimit
-        liveProbes                     = $main.Count
-        liveErrorPercent               = $mainErrorPercent
-        liveP95Ms                      = $mainP95
-        mainLatencyConfirmationP95Ms   = $mainLatencyConfirmationP95
-        mainLatencyConfirmationErrors  = $mainLatencyConfirmationErrors
-        mainLatencyConfirmationResult  = $mainLatencyConfirmationResult
-        candidateProbes                = $candidate.Count
-        candidateErrorPercent          = $candErrorPercent
-        candidateP95Ms                 = $candP95
-        result                         = $resultText
-        breaches                       = $breaches
+        step                          = $stepNumber
+        trafficToCandidatePercent     = $weight
+        baselineP95Ms                 = $baselineP95
+        effectiveLiveLimitMs          = $effectiveLiveLimit
+        effectiveCandidateLimitMs     = $effectiveLiveLimit
+        liveProbes                    = $main.Count
+        liveErrorPercent              = $mainErrorPercent
+        liveP95Ms                     = $mainP95
+        mainLatencyConfirmationP95Ms  = $mainLatencyConfirmationP95
+        mainLatencyConfirmationErrors = $mainLatencyConfirmationErrors
+        mainLatencyConfirmationResult = $mainLatencyConfirmationResult
+        candidateProbes               = $candidate.Count
+        candidateErrorPercent         = $candErrorPercent
+        candidateP95Ms                = $candP95
+        result                        = $resultText
+        breaches                      = $breaches
     }
 
     if ($breaches.Count -gt 0) {
-
         $reasonText = $breaches -join "; "
 
         Write-Host "##vso[task.logissue type=warning]Canary step $stepNumber FAILED: $reasonText"
@@ -995,7 +1016,6 @@ catch {
 }
 
 foreach ($revisionName in @($activeRevisions)) {
-
     if ($revisionName -ne $old -and $revisionName -ne $new) {
         Deactivate-Revision $revisionName
     }

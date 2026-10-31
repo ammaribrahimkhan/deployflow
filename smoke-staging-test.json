@@ -1,0 +1,16 @@
+{
+    "baseUrl":  "https://ca-deployflow-staging.whiteocean-f89f5f63.eastus2.azurecontainerapps.io",
+    "result":  "passed",
+    "expectedSha":  "1e9bfae",
+    "reportedSha":  "1e9bfae",
+    "expectedEnvironment":  "staging",
+    "reportedEnvironment":  "staging",
+    "requests":  20,
+    "failedRequests":  0,
+    "p95LatencyMs":  221,
+    "maxP95LatencyMs":  1500,
+    "failures":  [
+
+                 ],
+    "testedAtUtc":  "2026-10-31T13:28:27Z"
+}
