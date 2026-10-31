@@ -1,290 +1,545 @@
+
 # DeployFlow progressive production deployment with baseline-aware canary checks.
+
 param(
-  [Parameter(Mandatory = $true)] [string]$AppName,
-  [Parameter(Mandatory = $true)] [string]$ResourceGroup,
-  [Parameter(Mandatory = $true)] [string]$EnvironmentName,
-  [Parameter(Mandatory = $true)] [string]$MetadataPath,
-  [Parameter(Mandatory = $true)] [string]$RevisionSuffix,
-  [Parameter(Mandatory = $true)] [string]$OutputPath,
-  [string]$RunUrl = "",
-  [string]$RequiredRecordPath = "",
-  [string]$ExpectedEnvironment = "prod",
-  [string]$Steps = "10,50,100",
-  [int]$ObserveSeconds = 45,
-  [int]$ProbesPerStep = 30,
-  [double]$MaxErrorRatePercent = 5,
-  [int]$PreTrafficMaxP95Ms = 1500,
-  [int]$CanaryMaxP95Ms = 1500,
-  [double]$MaxLatencyIncreasePercent = 50,
-  [int]$InjectFaultPercent = 0,
-  [string]$ForceRedeploy = "false",
-  [int]$WarmupSeconds = 120,
-  [int]$BaselineAttempts = 3
+    [Parameter(Mandatory = $true)]
+    [string]$AppName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroup,
+
+    [Parameter(Mandatory = $true)]
+    [string]$EnvironmentName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$MetadataPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$RevisionSuffix,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath,
+
+    [string]$RunUrl = "",
+    [string]$RequiredRecordPath = "",
+    [string]$ExpectedEnvironment = "prod",
+    [string]$Steps = "10,50,100",
+    [int]$ObserveSeconds = 45,
+    [int]$ProbesPerStep = 30,
+    [double]$MaxErrorRatePercent = 5,
+    [int]$PreTrafficMaxP95Ms = 1500,
+    [int]$CanaryMaxP95Ms = 1500,
+    [double]$MaxLatencyIncreasePercent = 50,
+    [int]$InjectFaultPercent = 0,
+    [string]$ForceRedeploy = "false",
+    [int]$WarmupSeconds = 120,
+    [int]$BaselineAttempts = 3
 )
 
+$ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
 $force = ($ForceRedeploy -eq "true")
 
+# ------------------------------------------------------------
+# COMMON FUNCTIONS
+# ------------------------------------------------------------
+
 function Fail($message) {
-  Write-Host "##vso[task.logissue type=error]$message"
-  exit 1
+    Write-Host "##vso[task.logissue type=error]$message"
+    exit 1
 }
 
 function Invoke-Probe($url) {
-  $watch = [System.Diagnostics.Stopwatch]::StartNew()
-  $ok = $false
-  $revision = $null
-  $errorText = ""
 
-  try {
-    $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
-    if ($response.StatusCode -eq 200) {
-      $ok = $true
-      try {
-        $revision = ($response.Content | ConvertFrom-Json).revision
-      } catch {}
-    } else {
-      $errorText = "HTTP $($response.StatusCode)"
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $ok = $false
+    $revision = $null
+    $errorText = ""
+
+    try {
+        $response = Invoke-WebRequest `
+            -Uri $url `
+            -UseBasicParsing `
+            -TimeoutSec 10
+
+        if ($response.StatusCode -eq 200) {
+            $ok = $true
+
+            try {
+                $revision = ($response.Content | ConvertFrom-Json).revision
+            }
+            catch {
+                # Root endpoint may return HTML.
+                # Revision attribution is informational only.
+            }
+        }
+        else {
+            $errorText = "HTTP $($response.StatusCode)"
+        }
     }
-  } catch {
-    $errorText = $_.Exception.Message
-  }
+    catch {
+        $errorText = $_.Exception.Message
+    }
 
-  $watch.Stop()
+    $watch.Stop()
 
-  [pscustomobject]@{
-    Ok = $ok
-    Ms = [int]$watch.ElapsedMilliseconds
-    Revision = $revision
-    Error = $errorText
-  }
+    return [pscustomobject]@{
+        Ok       = $ok
+        Ms       = [int]$watch.ElapsedMilliseconds
+        Revision = $revision
+        Error    = $errorText
+    }
 }
 
 function Get-P95($values) {
-  $sorted = @($values | Sort-Object)
-  if ($sorted.Count -eq 0) { return 0 }
-  $index = [math]::Ceiling(0.95 * $sorted.Count) - 1
-  return [int]$sorted[$index]
+
+    $sorted = @($values | Sort-Object)
+
+    if ($sorted.Count -eq 0) {
+        return 0
+    }
+
+    $index = [math]::Ceiling(0.95 * $sorted.Count) - 1
+
+    return [int]$sorted[$index]
 }
 
 function Get-Traffic {
-  $text = az containerapp ingress traffic show --name $AppName --resource-group $ResourceGroup -o json | Out-String
-  if ($LASTEXITCODE -ne 0) { return @() }
-  return @(ConvertFrom-Json $text)
+
+    $text = & az containerapp ingress traffic show `
+        --name $AppName `
+        --resource-group $ResourceGroup `
+        -o json
+
+    if ($LASTEXITCODE -ne 0) {
+        return @()
+    }
+
+    try {
+        return @($text | Out-String | ConvertFrom-Json)
+    }
+    catch {
+        return @()
+    }
 }
 
 function Deactivate-Revision($name) {
-  az containerapp revision deactivate --name $AppName --resource-group $ResourceGroup --revision $name --output none
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host "##vso[task.logissue type=warning]Could not deactivate revision $name"
-  }
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        return
+    }
+
+    & az containerapp revision deactivate `
+        --name $AppName `
+        --resource-group $ResourceGroup `
+        --revision $name `
+        --output none
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "##vso[task.logissue type=warning]Could not deactivate revision $name."
+    }
 }
 
 function Finish($outcome, $exitCode, $message) {
-  $record.outcome = $outcome
-  $record.message = $message
-  $record.steps = $stepResults
-  $record.finishedAtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-  [System.IO.File]::WriteAllText(
-    $OutputPath,
-    ($record | ConvertTo-Json -Depth 8),
-    (New-Object System.Text.UTF8Encoding $false)
-  )
+    $record.outcome = $outcome
+    $record.message = $message
+    $record.steps = $stepResults
 
-  Write-Host "##vso[task.setvariable variable=promotionReady]true"
-  Write-Host ""
-  Write-Host "OUTCOME: $outcome"
+    $record.finishedAtUtc = (
+        Get-Date
+    ).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-  if ($exitCode -ne 0) {
-    Write-Host "##vso[task.logissue type=error]$message"
-  } else {
-    Write-Host $message
-  }
+    $trafficNow = Get-Traffic
 
-  exit $exitCode
+    if ($trafficNow.Count -gt 0) {
+        $record.finalTraffic = @(
+            $trafficNow | ForEach-Object {
+                "$($_.revisionName)=$($_.weight)"
+            }
+        )
+    }
+
+    [System.IO.File]::WriteAllText(
+        $OutputPath,
+        ($record | ConvertTo-Json -Depth 10),
+        (New-Object System.Text.UTF8Encoding $false)
+    )
+
+    Write-Host "##vso[task.setvariable variable=promotionReady]true"
+
+    Write-Host ""
+    Write-Host "========================================"
+    Write-Host "DEPLOYMENT OUTCOME: $outcome"
+    Write-Host "========================================"
+
+    if ($exitCode -ne 0) {
+        Write-Host "##vso[task.logissue type=error]$message"
+    }
+    else {
+        Write-Host $message
+    }
+
+    exit $exitCode
 }
 
 function Restore-Traffic {
-  Write-Host "Restoring 100% of traffic to known-good revision $old ..."
 
-  az containerapp ingress traffic set --name $AppName --resource-group $ResourceGroup --revision-weight "$old=100" --output none
-  $restoreOk = ($LASTEXITCODE -eq 0)
+    Write-Host "Restoring 100% traffic to known-good revision $old."
 
-  if ($restoreOk) {
-    Deactivate-Revision $new
-  }
+    & az containerapp ingress traffic set `
+        --name $AppName `
+        --resource-group $ResourceGroup `
+        --revision-weight "$old=100" `
+        --output none
 
-  $check = Get-Traffic | Where-Object {
-    $_.revisionName -eq $old -and $_.weight -eq 100
-  }
+    $restoreOk = ($LASTEXITCODE -eq 0)
 
-  return ($restoreOk -and [bool]$check)
+    if ($restoreOk) {
+        Deactivate-Revision $new
+    }
+
+    $check = Get-Traffic | Where-Object {
+        $_.revisionName -eq $old -and [int]$_.weight -eq 100
+    }
+
+    return ($restoreOk -and [bool]$check)
 }
 
-# Wakes a scaled-to-zero app and waits until it answers several times in a row.
+# Wakes a scaled-to-zero app and waits for three consecutive successful probes.
 function Wait-ForWarm($url, $maxSeconds) {
-  $deadline = (Get-Date).AddSeconds($maxSeconds)
-  $streak = 0
 
-  while ((Get-Date) -lt $deadline) {
-    $probe = Invoke-Probe $url
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    $streak = 0
 
-    if ($probe.Ok) {
-      $streak++
-      if ($streak -ge 3) { return $true }
-      Start-Sleep -Milliseconds 500
-    } else {
-      $streak = 0
-      Write-Host "Warm-up probe failed: $($probe.Error)"
-      Start-Sleep -Seconds 3
+    while ((Get-Date) -lt $deadline) {
+
+        $probe = Invoke-Probe $url
+
+        if ($probe.Ok) {
+
+            $streak++
+
+            if ($streak -ge 3) {
+                return $true
+            }
+
+            Start-Sleep -Milliseconds 500
+        }
+        else {
+
+            $streak = 0
+
+            Write-Host "Warm-up probe failed: $($probe.Error)"
+
+            Start-Sleep -Seconds 3
+        }
     }
-  }
 
-  return $false
+    return $false
 }
 
 function Measure-Endpoint($url, $count) {
-  $results = @()
 
-  for ($i = 1; $i -le $count; $i++) {
-    $results += Invoke-Probe $url
-    Start-Sleep -Milliseconds 250
-  }
+    $results = @()
 
-  $errors = @($results | Where-Object { -not $_.Ok }).Count
-  $errorPercent = [math]::Round(100.0 * $errors / $results.Count, 1)
-  $p95 = Get-P95 ($results | ForEach-Object { $_.Ms })
+    for ($i = 1; $i -le $count; $i++) {
 
-  return [pscustomobject]@{
-    Results = $results
-    Errors = $errors
-    ErrorPercent = $errorPercent
-    P95 = $p95
-    Count = $results.Count
-  }
+        $results += Invoke-Probe $url
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    $errors = @(
+        $results | Where-Object { -not $_.Ok }
+    ).Count
+
+    $errorPercent = [math]::Round(
+        100.0 * $errors / $results.Count,
+        1
+    )
+
+    $p95 = Get-P95 (
+        $results | ForEach-Object { $_.Ms }
+    )
+
+    return [pscustomobject]@{
+        Results      = $results
+        Errors       = $errors
+        ErrorPercent = $errorPercent
+        P95          = $p95
+        Count        = $results.Count
+    }
 }
 
-# 1. Validate release metadata and staging digest.
-if (-not (Test-Path $MetadataPath)) {
-  Fail "release-metadata.json not found: $MetadataPath"
+# ------------------------------------------------------------
+# 1. VALIDATE PARAMETERS
+# ------------------------------------------------------------
+
+if ($ProbesPerStep -lt 1) {
+    Fail "ProbesPerStep must be at least 1."
 }
 
-$meta = Get-Content $MetadataPath -Raw | ConvertFrom-Json
+if ($ObserveSeconds -lt 1) {
+    Fail "ObserveSeconds must be at least 1."
+}
+
+if ($WarmupSeconds -lt 1) {
+    Fail "WarmupSeconds must be at least 1."
+}
+
+if ($BaselineAttempts -lt 1) {
+    Fail "BaselineAttempts must be at least 1."
+}
+
+if ($MaxErrorRatePercent -lt 0 -or $MaxErrorRatePercent -gt 100) {
+    Fail "MaxErrorRatePercent must be between 0 and 100."
+}
+
+if ($InjectFaultPercent -lt 0 -or $InjectFaultPercent -gt 100) {
+    Fail "InjectFaultPercent must be between 0 and 100."
+}
+
+if ($MaxLatencyIncreasePercent -lt 0) {
+    Fail "MaxLatencyIncreasePercent cannot be negative."
+}
+
+if ($PreTrafficMaxP95Ms -lt 1 -or $CanaryMaxP95Ms -lt 1) {
+    Fail "Latency limits must be greater than zero."
+}
+
+try {
+    $stepList = @(
+        $Steps.Split(",") | ForEach-Object {
+            [int]$_.Trim()
+        }
+    )
+}
+catch {
+    Fail "Invalid Steps value. Example: 10,50,100"
+}
+
+if ($stepList.Count -eq 0) {
+    Fail "At least one traffic step is required."
+}
+
+if ($stepList[-1] -ne 100) {
+    Fail "The final traffic step must be 100."
+}
+
+$previousWeight = 0
+
+foreach ($weight in $stepList) {
+
+    if ($weight -lt 1 -or $weight -gt 100) {
+        Fail "Traffic steps must be between 1 and 100."
+    }
+
+    if ($weight -le $previousWeight) {
+        Fail "Traffic steps must be in strictly increasing order."
+    }
+
+    $previousWeight = $weight
+}
+
+Write-Host "Traffic rollout steps: $($stepList -join ', ')"
+Write-Host "Observation period: $ObserveSeconds seconds"
+Write-Host "Probes per step: $ProbesPerStep"
+
+# ------------------------------------------------------------
+# 2. VALIDATE RELEASE METADATA
+# ------------------------------------------------------------
+
+if (-not (Test-Path -LiteralPath $MetadataPath)) {
+    Fail "release-metadata.json not found: $MetadataPath"
+}
+
+try {
+    $meta = Get-Content -LiteralPath $MetadataPath -Raw | ConvertFrom-Json
+}
+catch {
+    Fail "Could not parse release-metadata.json."
+}
 
 if ($meta.security.gateResult -ne "passed") {
-  Fail "Security gate did not pass."
+    Fail "Security gate did not pass."
 }
 
 if ($meta.branch -ne "main") {
-  Fail "Only main branch images can be deployed."
+    Fail "Only main branch images can be deployed."
 }
 
-$imageRef = $meta.imageReference
+$imageRef = [string]$meta.imageReference
 
-if (-not $imageRef -or $imageRef -notmatch "@sha256:") {
-  Fail "Release metadata has no image digest."
+if ($imageRef -notmatch '^.+@sha256:[a-fA-F0-9]{64}$') {
+    Fail "Release metadata does not contain a valid SHA256 image digest."
 }
 
 $digest = $imageRef.Split("@")[1]
 
-if ($RequiredRecordPath) {
-  if (-not (Test-Path $RequiredRecordPath)) {
-    Fail "Staging promotion record not found."
-  }
-
-  $required = Get-Content $RequiredRecordPath -Raw | ConvertFrom-Json
-
-  if ($required.imageReference -ne $imageRef) {
-    Fail "Staging and production image digests do not match."
-  }
-
-  Write-Host "Digest matches the one verified in staging."
+if (-not $meta.shortSha -or -not $meta.gitSha) {
+    Fail "Release metadata is missing Git commit information."
 }
 
-$stepList = @($Steps.Split(",") | ForEach-Object { [int]($_.Trim()) })
+# ------------------------------------------------------------
+# 3. VERIFY STAGING PROMOTION
+# ------------------------------------------------------------
 
-if ($stepList.Count -eq 0 -or $stepList[-1] -ne 100) {
-  Fail "Steps must end with 100."
+if (-not [string]::IsNullOrWhiteSpace($RequiredRecordPath)) {
+
+    if (-not (Test-Path -LiteralPath $RequiredRecordPath)) {
+        Fail "Staging promotion record not found: $RequiredRecordPath"
+    }
+
+    try {
+        $required = Get-Content -LiteralPath $RequiredRecordPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        Fail "Could not parse staging promotion record."
+    }
+
+    if ($required.imageReference -ne $imageRef) {
+        Fail "Staging and production image digests do not match."
+    }
+
+    if ($required.outcome -and $required.outcome -notin @("promoted", "already_live")) {
+        Fail "Staging did not successfully promote this image. Outcome: $($required.outcome)"
+    }
+
+    Write-Host "Staging digest verification passed."
 }
 
-if ($MaxLatencyIncreasePercent -lt 0) {
-  Fail "MaxLatencyIncreasePercent cannot be negative."
-}
+# ------------------------------------------------------------
+# 4. VERIFY IMAGE IN ACR
+# ------------------------------------------------------------
 
 $registryHost = $imageRef.Split("/")[0]
 $registryName = $registryHost.Split(".")[0]
 $repoAndDigest = $imageRef.Substring($registryHost.Length + 1)
 
-az acr repository show --name $registryName --image $repoAndDigest --query digest -o tsv | Out-Null
+$verifiedDigest = & az acr repository show `
+    --name $registryName `
+    --image $repoAndDigest `
+    --query digest `
+    -o tsv
 
 if ($LASTEXITCODE -ne 0) {
-  Fail "Image was not found in ACR."
+    Fail "Image was not found in ACR."
 }
+
+$verifiedDigest = ([string]$verifiedDigest).Trim()
+
+if ($verifiedDigest -ne $digest) {
+    Fail "ACR digest verification failed. Expected $digest but received $verifiedDigest."
+}
+
+Write-Host "ACR image digest verified: $verifiedDigest"
+
+# ------------------------------------------------------------
+# 5. PREPARE OUTPUT AND PROMOTION RECORD
+# ------------------------------------------------------------
 
 $outDir = Split-Path -Parent $OutputPath
 
-if ($outDir -and -not (Test-Path $outDir)) {
-  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+if ([string]::IsNullOrWhiteSpace($outDir)) {
+    $outDir = (Get-Location).Path
+    $OutputPath = Join-Path $outDir (Split-Path -Leaf $OutputPath)
+}
+
+if (-not (Test-Path -LiteralPath $outDir)) {
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 }
 
 $stepResults = @()
 
 $record = [ordered]@{
-  environment = $EnvironmentName
-  appName = $AppName
-  resourceGroup = $ResourceGroup
-  imageReference = $imageRef
-  imageDigest = $digest
-  shortSha = $meta.shortSha
-  gitSha = $meta.gitSha
-  appVersion = $meta.appVersion
-  sourceBuildId = $meta.buildId
-  sourcePipelineRunUrl = $meta.pipelineRunUrl
-  strategy = "progressive: $Steps"
-  injectFaultPercent = $InjectFaultPercent
-  forceRedeploy = $force
-  baselineP95Ms = $null
-  maxLatencyIncreasePercent = $MaxLatencyIncreasePercent
-  outcome = "started"
-  message = ""
-  previousRevision = $null
-  previousImage = $null
-  candidateRevision = $null
-  steps = @()
-  finalTraffic = $null
-  startedAtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-  finishedAtUtc = $null
-  deploymentRunUrl = $RunUrl
+    environment               = $EnvironmentName
+    appName                   = $AppName
+    resourceGroup             = $ResourceGroup
+    imageReference            = $imageRef
+    imageDigest               = $digest
+    shortSha                  = $meta.shortSha
+    gitSha                    = $meta.gitSha
+    appVersion                = $meta.appVersion
+    sourceBuildId             = $meta.buildId
+    sourcePipelineRunUrl      = $meta.pipelineRunUrl
+    strategy                  = "progressive: $Steps"
+    observeSeconds            = $ObserveSeconds
+    probesPerStep             = $ProbesPerStep
+    injectFaultPercent        = $InjectFaultPercent
+    forceRedeploy             = $force
+    baselineP95Ms             = $null
+    maxLatencyIncreasePercent = $MaxLatencyIncreasePercent
+    outcome                   = "started"
+    message                   = ""
+    previousRevision          = $null
+    previousImage             = $null
+    candidateRevision         = $null
+    steps                     = @()
+    finalTraffic              = @()
+    startedAtUtc              = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    finishedAtUtc             = $null
+    deploymentRunUrl          = $RunUrl
 }
 
-# 2. Identify the current production revision.
-$stateText = az containerapp show --name $AppName --resource-group $ResourceGroup --query "{latest:properties.latestRevisionName,traffic:properties.configuration.ingress.traffic,fqdn:properties.configuration.ingress.fqdn}" -o json | Out-String
+# ------------------------------------------------------------
+# 6. IDENTIFY CURRENT PRODUCTION REVISION
+# ------------------------------------------------------------
+
+$stateText = & az containerapp show `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --query "{latest:properties.latestRevisionName,traffic:properties.configuration.ingress.traffic,fqdn:properties.configuration.ingress.fqdn}" `
+    -o json
 
 if ($LASTEXITCODE -ne 0) {
-  Fail "Could not read production Container App."
+    Fail "Could not read production Container App."
 }
 
-$state = ConvertFrom-Json $stateText
-$mainUrl = "https://" + $state.fqdn
+try {
+    $state = $stateText | Out-String | ConvertFrom-Json
+}
+catch {
+    Fail "Could not parse production Container App state."
+}
+
+if ([string]::IsNullOrWhiteSpace($state.fqdn)) {
+    Fail "Production Container App ingress FQDN is missing."
+}
+
+$mainUrl = "https://$($state.fqdn)"
+
+Write-Host "Production URL: $mainUrl"
 
 Write-Host "##vso[task.setvariable variable=appUrl]$mainUrl"
 Write-Host "##vso[task.setvariable variable=shortSha]$($meta.shortSha)"
 
-$full = @($state.traffic) | Where-Object { $_.weight -eq 100 } | Select-Object -First 1
+$full = @($state.traffic) | Where-Object {
+    [int]$_.weight -eq 100
+} | Select-Object -First 1
 
 if (-not $full) {
-  Fail "Production traffic is split. Restore a known-good revision before deploying."
+    Fail "Production traffic is split. Restore a known-good revision before deploying."
 }
 
-$old = $state.latest
-if ($full.revisionName) { $old = $full.revisionName }
+$old = [string]$full.revisionName
 
-$oldImage = (az containerapp revision show --name $AppName --resource-group $ResourceGroup --revision $old --query "properties.template.containers[0].image" -o tsv | Out-String).Trim()
-
-if ($LASTEXITCODE -ne 0 -or -not $oldImage) {
-  Fail "Could not read known-good revision image."
+if ([string]::IsNullOrWhiteSpace($old)) {
+    Fail "Could not identify known-good production revision."
 }
+
+$oldImage = & az containerapp revision show `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --revision $old `
+    --query "properties.template.containers[0].image" `
+    -o tsv
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($oldImage)) {
+    Fail "Could not read known-good revision image."
+}
+
+$oldImage = ([string]$oldImage).Trim()
 
 $record.previousRevision = $old
 $record.previousImage = $oldImage
@@ -293,218 +548,409 @@ Write-Host "Known-good revision: $old"
 Write-Host "Known-good image: $oldImage"
 Write-Host "Release image: $imageRef"
 
+# ------------------------------------------------------------
+# 7. SKIP IF THE IMAGE IS ALREADY LIVE
+# ------------------------------------------------------------
+
 if (($oldImage -eq $imageRef) -and (-not $force)) {
-  $record.candidateRevision = $old
-  Finish "already_live" 0 "This image is already live. Nothing to deploy."
+
+    $record.candidateRevision = $old
+
+    Finish "already_live" 0 "This exact image is already live. Nothing to deploy."
 }
 
-# 3. Warm up production, then measure the baseline BEFORE changing traffic.
+# ------------------------------------------------------------
+# 8. WARM PRODUCTION AND MEASURE BASELINE
+# ------------------------------------------------------------
+
 Write-Host ""
-Write-Host "=== Warming up production (it may be scaled to zero) ==="
+Write-Host "=== Warming up existing production ==="
 
 if (-not (Wait-ForWarm $mainUrl $WarmupSeconds)) {
-  Fail "Production did not respond successfully within $WarmupSeconds seconds. Check the app and the agent's internet connection. Production was not changed."
+    Fail "Production did not respond successfully within $WarmupSeconds seconds. No traffic was changed."
 }
 
 Write-Host "Production is warm."
+
 Write-Host ""
 Write-Host "=== Measuring existing production baseline ==="
 
 $baseline = $null
 
 for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
-  $baseline = Measure-Endpoint $mainUrl $ProbesPerStep
 
-  Write-Host "Baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
+    $baseline = Measure-Endpoint $mainUrl $ProbesPerStep
 
-  if ($baseline.ErrorPercent -le $MaxErrorRatePercent) { break }
+    Write-Host "Baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
 
-  foreach ($failedProbe in @($baseline.Results | Where-Object { -not $_.Ok } | Select-Object -First 3)) {
-    Write-Host "  Failed probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
-  }
+    if ($baseline.ErrorPercent -le $MaxErrorRatePercent) {
+        break
+    }
 
-  if ($attempt -lt $BaselineAttempts) {
-    Write-Host "Baseline error rate is above $MaxErrorRatePercent%. Waiting 15 seconds and measuring again..."
-    Start-Sleep -Seconds 15
-  }
+    foreach ($failedProbe in @(
+        $baseline.Results |
+        Where-Object { -not $_.Ok } |
+        Select-Object -First 3
+    )) {
+        Write-Host "Failed probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
+    }
+
+    if ($attempt -lt $BaselineAttempts) {
+        Write-Host "Baseline error rate is above the configured limit. Waiting 15 seconds."
+        Start-Sleep -Seconds 15
+    }
 }
 
 if ($baseline.ErrorPercent -gt $MaxErrorRatePercent) {
-  Fail "Existing production baseline stayed above $MaxErrorRatePercent% errors after $BaselineAttempts attempts (last: $($baseline.Errors) of $($baseline.Count) probes failed). Fix production health before starting a canary."
+    Fail "Existing production baseline stayed above $MaxErrorRatePercent% errors. Fix production health before starting a canary."
 }
 
-# The baseline latency uses successful probes only, so one timeout cannot distort it.
-$okLatencies = @($baseline.Results | Where-Object { $_.Ok } | ForEach-Object { $_.Ms })
+$okLatencies = @(
+    $baseline.Results |
+    Where-Object { $_.Ok } |
+    ForEach-Object { $_.Ms }
+)
+
 $baselineP95 = Get-P95 $okLatencies
+
 $record.baselineP95Ms = $baselineP95
 
 Write-Host "Production baseline: $($okLatencies.Count) successful probes, p95 $baselineP95 ms"
 
-# 4. Keep the known-good revision at 100%, then create candidate.
-az containerapp ingress traffic set --name $AppName --resource-group $ResourceGroup --revision-weight "$old=100" --output none
+# ------------------------------------------------------------
+# 9. PIN KNOWN-GOOD REVISION TO 100%
+# ------------------------------------------------------------
+
+& az containerapp ingress traffic set `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --revision-weight "$old=100" `
+    --output none
 
 if ($LASTEXITCODE -ne 0) {
-  Finish "failed_before_deploy" 1 "Could not pin production traffic."
+    Finish "failed_before_deploy" 1 "Could not pin production traffic to the known-good revision."
 }
 
-Write-Host "Creating candidate from the verified image digest..."
+# ------------------------------------------------------------
+# 10. CREATE CANDIDATE REVISION
+# ------------------------------------------------------------
 
-az containerapp update --name $AppName --resource-group $ResourceGroup --image $imageRef --revision-suffix $RevisionSuffix --set-env-vars "FAULT_INJECTION_PERCENT=$InjectFaultPercent" --output none
+Write-Host ""
+Write-Host "=== Creating candidate revision ==="
+
+& az containerapp update `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --image $imageRef `
+    --revision-suffix $RevisionSuffix `
+    --set-env-vars "FAULT_INJECTION_PERCENT=$InjectFaultPercent" `
+    --output none
 
 if ($LASTEXITCODE -ne 0) {
-  Finish "failed_before_traffic" 1 "Candidate deployment failed. Production traffic was not shifted."
+    Finish "failed_before_traffic" 1 "Candidate deployment failed. Production traffic was not shifted."
 }
 
-$candText = az containerapp show --name $AppName --resource-group $ResourceGroup --query "{latest:properties.latestRevisionName,fqdn:properties.latestRevisionFqdn}" -o json | Out-String
+$candText = & az containerapp show `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --query "{latest:properties.latestRevisionName,fqdn:properties.latestRevisionFqdn}" `
+    -o json
 
 if ($LASTEXITCODE -ne 0) {
-  Finish "failed_before_traffic" 1 "Could not identify candidate revision."
+    Finish "failed_before_traffic" 1 "Could not identify candidate revision."
 }
 
-$cand = ConvertFrom-Json $candText
-$new = $cand.latest
+try {
+    $cand = $candText | Out-String | ConvertFrom-Json
+}
+catch {
+    Finish "failed_before_traffic" 1 "Could not parse candidate revision information."
+}
+
+$new = [string]$cand.latest
+
 $record.candidateRevision = $new
 
-if (-not $new -or $new -eq $old -or -not $cand.fqdn) {
-  Finish "failed_before_traffic" 1 "Candidate revision could not be identified."
+if (
+    [string]::IsNullOrWhiteSpace($new) -or
+    $new -eq $old -or
+    [string]::IsNullOrWhiteSpace($cand.fqdn)
+) {
+    Finish "failed_before_traffic" 1 "Candidate revision could not be identified."
 }
 
-$candUrl = "https://" + $cand.fqdn
+$candUrl = "https://$($cand.fqdn)"
 
 Write-Host "Candidate revision: $new"
-Write-Host "Candidate URL: $candUrl (0% traffic)"
+Write-Host "Candidate URL: $candUrl"
 
-# 5. Candidate pre-traffic smoke test.
-& (Join-Path $here "smoke-test.ps1") -BaseUrl $candUrl -ExpectedSha $meta.shortSha -ExpectedEnvironment $ExpectedEnvironment -MaxP95Ms $PreTrafficMaxP95Ms -OutputPath (Join-Path $outDir "smoke-candidate-production.json")
+# ------------------------------------------------------------
+# 11. CANDIDATE PRE-TRAFFIC SMOKE TEST
+# ------------------------------------------------------------
 
-if ($LASTEXITCODE -ne 0) {
-  Deactivate-Revision $new
-  Finish "aborted_before_traffic" 1 "Candidate failed pre-traffic smoke test. Production remains on the known-good revision."
+Write-Host ""
+Write-Host "=== Candidate pre-traffic smoke test ==="
+
+& (Join-Path $here "smoke-test.ps1") `
+    -BaseUrl $candUrl `
+    -ExpectedSha $meta.shortSha `
+    -ExpectedEnvironment $ExpectedEnvironment `
+    -MaxP95Ms $PreTrafficMaxP95Ms `
+    -OutputPath (Join-Path $outDir "smoke-candidate-production.json")
+
+$smokeSucceeded = $?
+
+if (-not $smokeSucceeded) {
+
+    Deactivate-Revision $new
+
+    Finish `
+        "aborted_before_traffic" `
+        1 `
+        "Candidate failed pre-traffic smoke test. Production remains on the known-good revision."
 }
 
-# 6. Progressive traffic rollout.
+Write-Host "Candidate pre-traffic smoke test passed."
+
+# ------------------------------------------------------------
+# 12. PROGRESSIVE TRAFFIC ROLLOUT
+# ------------------------------------------------------------
+
 $stepNumber = 0
 
 foreach ($weight in $stepList) {
-  $stepNumber++
 
-  Write-Host ""
-  Write-Host "=== Step $stepNumber of $($stepList.Count): $weight% candidate traffic ==="
+    $stepNumber++
 
-  if ($weight -ge 100) {
-    $weights = @("$new=100")
-  } else {
-    $weights = @("$old=$([int](100 - $weight))", "$new=$weight")
-  }
+    Write-Host ""
+    Write-Host "========================================"
+    Write-Host "STEP $stepNumber OF $($stepList.Count): $weight% CANDIDATE TRAFFIC"
+    Write-Host "========================================"
 
-  az containerapp ingress traffic set --name $AppName --resource-group $ResourceGroup --revision-weight $weights --output none
+    if ($weight -ge 100) {
+        $weights = @("$new=100")
+    }
+    else {
+        $oldWeight = [int](100 - $weight)
 
-  if ($LASTEXITCODE -ne 0) {
-    $restored = Restore-Traffic
-    Finish "rolled_back" 1 "Traffic shift failed. Rollback confirmed: $restored"
-  }
-
-  Start-Sleep -Seconds 10
-
-  # Warm both revisions.
-  for ($w = 1; $w -le 4; $w++) {
-    $null = Invoke-Probe "$mainUrl/"
-    $null = Invoke-Probe "$candUrl/"
-  }
-
-  # Measure the public production endpoint and candidate direct endpoint.
-  $main = Measure-Endpoint $mainUrl $ProbesPerStep
-  $candidate = Measure-Endpoint $candUrl $ProbesPerStep
-
-  $mainP95 = $main.P95
-  $candP95 = $candidate.P95
-
-  $mainErrorPercent = $main.ErrorPercent
-  $candErrorPercent = $candidate.ErrorPercent
-
-  $allowedBaselineP95 = [math]::Ceiling($baselineP95 * (1 + ($MaxLatencyIncreasePercent / 100.0)))
-  $effectiveLiveLimit = [math]::Min($CanaryMaxP95Ms, $allowedBaselineP95)
-
-  Write-Host "Baseline p95: $baselineP95 ms"
-  Write-Host "Allowed live p95: $effectiveLiveLimit ms"
-  Write-Host "Live URL: $($main.Count) probes, $($main.Errors) errors ($mainErrorPercent%), p95 $mainP95 ms"
-  Write-Host "Candidate: $($candidate.Count) probes, $($candidate.Errors) errors ($candErrorPercent%), p95 $candP95 ms"
-
-  $breaches = @()
-
-  if ($mainErrorPercent -gt $MaxErrorRatePercent) {
-    $breaches += "Live error rate $mainErrorPercent% exceeds $MaxErrorRatePercent%"
-  }
-
-  if ($candErrorPercent -gt $MaxErrorRatePercent) {
-    $breaches += "Candidate error rate $candErrorPercent% exceeds $MaxErrorRatePercent%"
-  }
-
-  if ($mainP95 -gt $effectiveLiveLimit) {
-    $breaches += "Live p95 $mainP95 ms exceeds effective limit $effectiveLiveLimit ms"
-  }
-
-  if ($candP95 -gt $CanaryMaxP95Ms) {
-    $breaches += "Candidate p95 $candP95 ms exceeds $CanaryMaxP95Ms ms"
-  }
-
-  $resultText = "pass"
-  if ($breaches.Count -gt 0) { $resultText = "fail" }
-
-  $stepResults += [ordered]@{
-    step = $stepNumber
-    trafficToCandidatePercent = $weight
-    baselineP95Ms = $baselineP95
-    effectiveLiveLimitMs = $effectiveLiveLimit
-    liveProbes = $main.Count
-    liveErrorPercent = $mainErrorPercent
-    liveP95Ms = $mainP95
-    candidateProbes = $candidate.Count
-    candidateErrorPercent = $candErrorPercent
-    candidateP95Ms = $candP95
-    result = $resultText
-    breaches = $breaches
-  }
-
-  if ($breaches.Count -gt 0) {
-    $reasonText = $breaches -join "; "
-    Write-Host "##vso[task.logissue type=warning]Canary step $stepNumber FAILED: $reasonText"
-
-    $restored = Restore-Traffic
-
-    if (-not $restored) {
-      Finish "rollback_failed" 1 "CRITICAL: rollback could not be confirmed. Run deployflow-rollback pipeline."
+        $weights = @(
+            "$old=$oldWeight",
+            "$new=$weight"
+        )
     }
 
-    Write-Host "Checking production after rollback..."
-
-    & (Join-Path $here "smoke-test.ps1") -BaseUrl $mainUrl -ExpectedSha "" -ExpectedEnvironment $ExpectedEnvironment -MaxP95Ms 5000 -OutputPath (Join-Path $outDir "smoke-after-rollback.json")
+    & az containerapp ingress traffic set `
+        --name $AppName `
+        --resource-group $ResourceGroup `
+        --revision-weight $weights `
+        --output none
 
     if ($LASTEXITCODE -ne 0) {
-      Finish "rollback_failed" 1 "Traffic restored but production health verification failed."
+
+        $restored = Restore-Traffic
+
+        if (-not $restored) {
+            Finish "rollback_failed" 1 "Traffic shift failed and rollback could not be confirmed. Manual recovery is required."
+        }
+
+        Finish "rolled_back" 1 "Traffic shift failed. Traffic restored to $old."
     }
 
-    Finish "rolled_back" 1 "Canary step $stepNumber failed: $reasonText. Traffic restored to $old."
-  }
+    Write-Host "Traffic shifted. Observing for $ObserveSeconds seconds."
 
-  Write-Host "Step $stepNumber passed."
+    Start-Sleep -Seconds $ObserveSeconds
+
+    # Warm both endpoints before measuring.
+    for ($w = 1; $w -le 4; $w++) {
+        $null = Invoke-Probe "$mainUrl/"
+        $null = Invoke-Probe "$candUrl/"
+    }
+
+    # Measure live production and candidate directly.
+    $main = Measure-Endpoint $mainUrl $ProbesPerStep
+    $candidate = Measure-Endpoint $candUrl $ProbesPerStep
+
+    $mainP95 = $main.P95
+    $candP95 = $candidate.P95
+
+    $mainErrorPercent = $main.ErrorPercent
+    $candErrorPercent = $candidate.ErrorPercent
+
+    $allowedBaselineP95 = [math]::Ceiling(
+        $baselineP95 * (1 + ($MaxLatencyIncreasePercent / 100.0))
+    )
+
+    $effectiveLiveLimit = [math]::Min(
+        $CanaryMaxP95Ms,
+        $allowedBaselineP95
+    )
+
+    Write-Host "Baseline p95: $baselineP95 ms"
+    Write-Host "Effective live p95 limit: $effectiveLiveLimit ms"
+
+    Write-Host "Live endpoint: $($main.Count) probes, $($main.Errors) errors ($mainErrorPercent%), p95 $mainP95 ms"
+
+    Write-Host "Candidate endpoint: $($candidate.Count) probes, $($candidate.Errors) errors ($candErrorPercent%), p95 $candP95 ms"
+
+    # Evaluate rollout gates.
+    $breaches = @()
+
+    if ($mainErrorPercent -gt $MaxErrorRatePercent) {
+        $breaches += "Live error rate $mainErrorPercent% exceeds $MaxErrorRatePercent%."
+    }
+
+    if ($candErrorPercent -gt $MaxErrorRatePercent) {
+        $breaches += "Candidate error rate $candErrorPercent% exceeds $MaxErrorRatePercent%."
+    }
+
+    if ($mainP95 -gt $effectiveLiveLimit) {
+        $breaches += "Live p95 $mainP95 ms exceeds effective limit $effectiveLiveLimit ms."
+    }
+
+    if ($candP95 -gt $CanaryMaxP95Ms) {
+        $breaches += "Candidate p95 $candP95 ms exceeds $CanaryMaxP95Ms ms."
+    }
+
+    $resultText = "pass"
+
+    if ($breaches.Count -gt 0) {
+        $resultText = "fail"
+    }
+
+    $stepResults += [ordered]@{
+        step                       = $stepNumber
+        trafficToCandidatePercent  = $weight
+        baselineP95Ms              = $baselineP95
+        effectiveLiveLimitMs       = $effectiveLiveLimit
+        liveProbes                 = $main.Count
+        liveErrorPercent           = $mainErrorPercent
+        liveP95Ms                  = $mainP95
+        candidateProbes            = $candidate.Count
+        candidateErrorPercent      = $candErrorPercent
+        candidateP95Ms             = $candP95
+        result                     = $resultText
+        breaches                   = $breaches
+    }
+
+    if ($breaches.Count -gt 0) {
+
+        $reasonText = $breaches -join "; "
+
+        Write-Host "##vso[task.logissue type=warning]Canary step $stepNumber FAILED: $reasonText"
+
+        $restored = Restore-Traffic
+
+        if (-not $restored) {
+            Finish "rollback_failed" 1 "CRITICAL: rollback could not be confirmed. Run the rollback pipeline."
+        }
+
+        Write-Host "Checking production after rollback..."
+
+        & (Join-Path $here "smoke-test.ps1") `
+            -BaseUrl $mainUrl `
+            -ExpectedSha "" `
+            -ExpectedEnvironment $ExpectedEnvironment `
+            -MaxP95Ms 5000 `
+            -OutputPath (Join-Path $outDir "smoke-after-rollback.json")
+
+        $rollbackSmokeSucceeded = $?
+
+        if (-not $rollbackSmokeSucceeded) {
+            Finish "rollback_failed" 1 "Traffic restored but production health verification failed."
+        }
+
+        Finish `
+            "rolled_back" `
+            1 `
+            "Canary step $stepNumber failed: $reasonText. Traffic restored to $old."
+    }
+
+    Write-Host "Step $stepNumber passed."
 }
 
-# 7. Keep previous revision active for fast rollback.
-$activeText = az containerapp revision list --name $AppName --resource-group $ResourceGroup --query "[?properties.active].name" -o json | Out-String
+# ------------------------------------------------------------
+# 13. VERIFY FINAL TRAFFIC AND KEEP OLD REVISION ACTIVE
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "=== Verifying final production traffic ==="
+
+$finalTraffic = Get-Traffic
+
+$finalCandidate = @(
+    $finalTraffic | Where-Object {
+        $_.revisionName -eq $new -and [int]$_.weight -eq 100
+    }
+)
+
+if (-not $finalCandidate) {
+    Finish "verification_failed" 1 "Candidate did not receive 100% production traffic."
+}
+
+$finalOld = @(
+    $finalTraffic | Where-Object {
+        $_.revisionName -eq $old
+    }
+)
+
+if ($finalOld.Count -eq 0) {
+    Write-Host "Previous revision is no longer in the traffic list."
+}
+else {
+    Write-Host "Previous revision remains configured for rollback."
+}
+
+# Confirm the candidate image is still the expected digest.
+$finalImage = & az containerapp revision show `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --revision $new `
+    --query "properties.template.containers[0].image" `
+    -o tsv
+
+if ($LASTEXITCODE -ne 0 -or ([string]$finalImage).Trim() -ne $imageRef) {
+    Finish "verification_failed" 1 "Final candidate image verification failed."
+}
+
+# ------------------------------------------------------------
+# 14. CLEAN UP OTHER ACTIVE REVISIONS
+# ------------------------------------------------------------
+
+$activeText = & az containerapp revision list `
+    --name $AppName `
+    --resource-group $ResourceGroup `
+    --query "[?properties.active].name" `
+    -o json
 
 if ($LASTEXITCODE -ne 0) {
-  Finish "promoted_with_cleanup_warning" 1 "Release completed but could not inspect active revisions."
+    Finish "promoted_with_cleanup_warning" 1 "Release completed but could not inspect active revisions."
 }
 
-$activeRevisions = ConvertFrom-Json $activeText
+try {
+    $activeRevisions = $activeText | Out-String | ConvertFrom-Json
+}
+catch {
+    Finish "promoted_with_cleanup_warning" 1 "Release completed but active revision list could not be parsed."
+}
 
 foreach ($revisionName in @($activeRevisions)) {
-  if ($revisionName -ne $old -and $revisionName -ne $new) {
-    Deactivate-Revision $revisionName
-  }
+
+    if ($revisionName -ne $old -and $revisionName -ne $new) {
+        Deactivate-Revision $revisionName
+    }
 }
 
-$record.finalTraffic = @(Get-Traffic | ForEach-Object { "$($_.revisionName)=$($_.weight)" })
+# ------------------------------------------------------------
+# 15. FINAL PROMOTION RECORD
+# ------------------------------------------------------------
 
-Finish "promoted" 0 "Release promoted: $new now serves 100% of production traffic. Previous revision $old remains active for rollback."
+$record.finalTraffic = @(
+    Get-Traffic | ForEach-Object {
+        "$($_.revisionName)=$($_.weight)"
+    }
+)
+
+Finish `
+    "promoted" `
+    0 `
+    "Release promoted successfully: $new now serves 100% of production traffic. Previous revision $old remains active for rollback."
