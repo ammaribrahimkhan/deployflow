@@ -6,6 +6,8 @@ locals {
   }
 }
 
+data "azurerm_subscription" "current" {}
+
 resource "azurerm_resource_group" "shared" {
   name     = "rg-${var.project}-shared-${var.location_short}"
   location = var.location
@@ -55,4 +57,41 @@ resource "azurerm_container_app_environment" "shared" {
   resource_group_name        = azurerm_resource_group.shared.name
   log_analytics_workspace_id = azurerm_log_analytics_workspace.platform.id
   tags                       = local.tags
+}
+
+# Who gets told when an alert fires.
+resource "azurerm_monitor_action_group" "ops" {
+  name                = "ag-${var.project}-ops"
+  resource_group_name = azurerm_resource_group.shared.name
+  short_name          = "dfops"
+  tags                = local.tags
+
+  email_receiver {
+    name                    = "ops-email"
+    email_address           = var.alert_email
+    use_common_alert_schema = true
+  }
+}
+
+# Infrastructure issues: Azure service incidents in our region.
+resource "azurerm_monitor_activity_log_alert" "service_health" {
+  name                = "alert-${var.project}-service-health"
+  resource_group_name = azurerm_resource_group.shared.name
+  location            = "global"
+  scopes              = [data.azurerm_subscription.current.id]
+  description         = "An Azure service incident affects East US 2."
+  tags                = local.tags
+
+  criteria {
+    category = "ServiceHealth"
+
+    service_health {
+      events    = ["Incident"]
+      locations = ["East US 2"]
+    }
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.ops.id
+  }
 }

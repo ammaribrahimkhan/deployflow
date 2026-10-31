@@ -31,3 +31,13 @@ variable "pipeline_principal_object_id" {
     error_message = "pipeline_principal_object_id must be a GUID."
   }
 }
+
+variable "alert_email" {
+  description = "Email address that receives alert notifications."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "alert_email must be a valid email address."
+  }
+}

@@ -40,6 +40,30 @@ variable "container_app_environment_name" {
   default     = "cae-deployflow-shared-eus2"
 }
 
+variable "platform_workspace_name" {
+  description = "Name of the platform Log Analytics workspace that holds the container logs."
+  type        = string
+  default     = "log-deployflow-shared-eus2"
+}
+
+variable "action_group_name" {
+  description = "Name of the shared alert action group."
+  type        = string
+  default     = "ag-deployflow-ops"
+}
+
+variable "enable_availability_test" {
+  description = "Create the availability test and its alert (small monthly cost)."
+  type        = bool
+  default     = false
+}
+
+variable "latency_alert_threshold_ms" {
+  description = "Average response time (ms) that triggers the latency alert. Lower it temporarily to test the alert."
+  type        = number
+  default     = 1000
+}
+
 variable "image_name" {
   description = "Repository name of the image in the registry."
   type        = string

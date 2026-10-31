@@ -1,0 +1,16 @@
+let sloTarget = 99.0;
+let latencyTargetMs = 500.0;
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(__HOURS__h)
+| where ContainerAppName_s == '__APP_NAME__'
+| where Log_s startswith '{'
+| extend j = parse_json(Log_s)
+| where isnotnull(j.status)
+| extend status = toint(j.status), path = tostring(j.path), durationMs = todouble(j.durationMs)
+| where path !startswith '/health'
+| summarize total = count(), failed = countif(status >= 500), slow = countif(durationMs > latencyTargetMs)
+| extend availabilitySli = iff(total == 0, 100.0, round(100.0 * (total - failed) / total, 3)),
+    latencySli = iff(total == 0, 100.0, round(100.0 * (total - slow) / total, 3)),
+    errorBudgetRequests = round(total * (100.0 - sloTarget) / 100.0, 2),
+    budgetUsedPercent = iff(total == 0, 0.0, round(100.0 * failed / (total * (100.0 - sloTarget) / 100.0), 1))
+| extend sloMet = availabilitySli >= sloTarget

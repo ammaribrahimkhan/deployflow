@@ -17,8 +17,8 @@ resource "azurerm_resource_group" "this" {
   }
 }
 
-# The registry and the Container Apps environment are created by the
-# "shared" stack, which must be applied first.
+# The registry, the Container Apps environment, the platform log workspace and the
+# action group are created by the "shared" stack, which must be applied first.
 data "azurerm_container_registry" "shared" {
   name                = var.acr_name
   resource_group_name = var.shared_resource_group_name
@@ -26,6 +26,16 @@ data "azurerm_container_registry" "shared" {
 
 data "azurerm_container_app_environment" "shared" {
   name                = var.container_app_environment_name
+  resource_group_name = var.shared_resource_group_name
+}
+
+data "azurerm_log_analytics_workspace" "platform" {
+  name                = var.platform_workspace_name
+  resource_group_name = var.shared_resource_group_name
+}
+
+data "azurerm_monitor_action_group" "ops" {
+  name                = var.action_group_name
   resource_group_name = var.shared_resource_group_name
 }
 
@@ -54,6 +64,24 @@ module "container_app" {
   acr_login_server             = data.azurerm_container_registry.shared.login_server
   image_name                   = var.image_name
   image_tag                    = var.image_tag
+}
+
+module "alerts" {
+  source = "../../modules/alerts"
+
+  environment                = var.environment
+  location                   = var.location
+  resource_group_name        = azurerm_resource_group.this.name
+  tags                       = local.tags
+  container_app_id           = module.container_app.app_id
+  container_app_name         = module.container_app.app_name
+  log_analytics_workspace_id = data.azurerm_log_analytics_workspace.platform.id
+  app_insights_id            = module.monitoring.app_insights_id
+  action_group_id            = data.azurerm_monitor_action_group.ops.id
+  availability_url           = "${module.container_app.url}/health"
+  enable_availability_test   = var.enable_availability_test
+  latency_threshold_ms       = var.latency_alert_threshold_ms
+  severity                   = 1
 }
 
 # Lets the CD pipeline deploy new revisions of this environment's app.

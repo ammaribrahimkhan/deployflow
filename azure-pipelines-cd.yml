@@ -1,15 +1,16 @@
-# DeployFlow CD pipeline (Milestone 6)
+# DeployFlow CD pipeline (Milestone 7)
 #
 # Starts automatically when the CI pipeline's BuildPush stage succeeds on main.
 # It NEVER builds anything: it deploys the exact image digest that CI built, scanned and pushed.
 #
-#   Stage Staging:     deploy by digest -> smoke test -> promotion record
+#   Stage Staging:     deploy by digest -> smoke test -> deployment event -> promotion record
 #   Stage Production:  manual approval + branch check (on the "production" environment)
 #                      -> confirm the digest equals the one verified in staging
 #                      -> progressive release: candidate at 0% -> pre-traffic smoke test
 #                         -> 10% -> 50% -> 100%, with automatic rollback on any breach
-#                      -> final smoke test -> promotion record
+#                      -> final smoke test -> deployment event -> promotion record
 #
+# Every deployment is also recorded as an event in Application Insights (best effort).
 # Never runs for pull requests.
 # The "demo" parameters let you prove the safety features on purpose; leave them at their defaults
 # for normal releases.
@@ -47,10 +48,6 @@ parameters:
     displayName: Production canary - maximum error rate (percent)
     type: number
     default: 5
-  - name: maxLatencyIncreasePercent
-    displayName: Production canary - allowed live p95 increase over the baseline (percent)
-    type: number
-    default: 150
   - name: forceProductionRedeploy
     displayName: DEMO - redeploy to production even if this image is already live
     type: boolean
@@ -70,10 +67,14 @@ variables:
     value: ca-deployflow-staging
   - name: stagingResourceGroup
     value: rg-deployflow-staging-eus2
+  - name: stagingAppInsights
+    value: appi-deployflow-staging-eus2
   - name: prodApp
     value: ca-deployflow-prod
   - name: prodResourceGroup
     value: rg-deployflow-prod-eus2
+  - name: prodAppInsights
+    value: appi-deployflow-prod-eus2
 
 stages:
   # ---------------------------------------------------------------------------
@@ -113,6 +114,19 @@ stages:
                   workingDirectory: $(Build.SourcesDirectory)
                   displayName: Smoke test staging
 
+                - task: AzureCLI@2
+                  displayName: Record the deployment event in Application Insights
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  continueOnError: true
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\send-deployment-event.ps1
+                    arguments: -AppInsightsName $(stagingAppInsights) -ResourceGroup $(stagingResourceGroup) -RecordPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-staging.json" -EnvironmentName staging -EventName Deployment -JobStatus "$(Agent.JobStatus)" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
+
                 - publish: $(Build.ArtifactStagingDirectory)/promotion
                   artifact: promotion-staging
                   condition: and(always(), eq(variables['promotionReady'], 'true'))
@@ -151,7 +165,7 @@ stages:
                     scriptType: ps
                     scriptLocation: scriptPath
                     scriptPath: $(Build.SourcesDirectory)\scripts\deploy-progressive.ps1
-                    arguments: -AppName $(prodApp) -ResourceGroup $(prodResourceGroup) -EnvironmentName production -MetadataPath "$(Pipeline.Workspace)\ci\release-evidence\release-metadata.json" -RequiredRecordPath "$(Pipeline.Workspace)\promotion-staging\promotion-staging.json" -RevisionSuffix "b$(Build.BuildId)-a$(System.StageAttempt)" -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-production.json" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" -ExpectedEnvironment prod -PreTrafficMaxP95Ms ${{ parameters.preTrafficMaxP95Ms }} -CanaryMaxP95Ms ${{ parameters.canaryMaxP95Ms }} -MaxErrorRatePercent ${{ parameters.canaryMaxErrorPercent }} -MaxLatencyIncreasePercent ${{ parameters.maxLatencyIncreasePercent }} -InjectFaultPercent ${{ parameters.injectFaultPercent }} -ForceRedeploy ${{ parameters.forceProductionRedeploy }}
+                    arguments: -AppName $(prodApp) -ResourceGroup $(prodResourceGroup) -EnvironmentName production -MetadataPath "$(Pipeline.Workspace)\ci\release-evidence\release-metadata.json" -RequiredRecordPath "$(Pipeline.Workspace)\promotion-staging\promotion-staging.json" -RevisionSuffix "b$(Build.BuildId)-a$(System.StageAttempt)" -OutputPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-production.json" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" -ExpectedEnvironment prod -PreTrafficMaxP95Ms ${{ parameters.preTrafficMaxP95Ms }} -CanaryMaxP95Ms ${{ parameters.canaryMaxP95Ms }} -MaxErrorRatePercent ${{ parameters.canaryMaxErrorPercent }} -InjectFaultPercent ${{ parameters.injectFaultPercent }} -ForceRedeploy ${{ parameters.forceProductionRedeploy }}
                     failOnStandardError: false
                     workingDirectory: $(Build.SourcesDirectory)
 
@@ -160,6 +174,19 @@ stages:
                     if ($LASTEXITCODE -ne 0) { exit 1 }
                   workingDirectory: $(Build.SourcesDirectory)
                   displayName: Final smoke test of production
+
+                - task: AzureCLI@2
+                  displayName: Record the deployment event in Application Insights
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  continueOnError: true
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\send-deployment-event.ps1
+                    arguments: -AppInsightsName $(prodAppInsights) -ResourceGroup $(prodResourceGroup) -RecordPath "$(Build.ArtifactStagingDirectory)\promotion\promotion-production.json" -EnvironmentName production -EventName Deployment -JobStatus "$(Agent.JobStatus)" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
 
                 - publish: $(Build.ArtifactStagingDirectory)/promotion
                   artifact: promotion-production

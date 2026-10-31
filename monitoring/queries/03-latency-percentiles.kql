@@ -1,0 +1,10 @@
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(__HOURS__h)
+| where ContainerAppName_s == '__APP_NAME__'
+| where Log_s startswith '{'
+| extend j = parse_json(Log_s)
+| where isnotnull(j.status)
+| extend path = tostring(j.path), durationMs = todouble(j.durationMs), revision = tostring(j.revision)
+| where path !startswith '/health'
+| summarize requests = count(), p50Ms = round(percentile(durationMs, 50), 1), p95Ms = round(percentile(durationMs, 95), 1), p99Ms = round(percentile(durationMs, 99), 1) by bin(TimeGenerated, 5m), revision
+| order by TimeGenerated desc

@@ -32,3 +32,13 @@ output "log_analytics_workspace_name" {
   description = "Name of the platform Log Analytics workspace."
   value       = azurerm_log_analytics_workspace.platform.name
 }
+
+output "action_group_name" {
+  description = "Name of the alert action group."
+  value       = azurerm_monitor_action_group.ops.name
+}
+
+output "action_group_id" {
+  description = "Resource ID of the alert action group."
+  value       = azurerm_monitor_action_group.ops.id
+}

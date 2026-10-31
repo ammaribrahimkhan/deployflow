@@ -1,3 +1,8 @@
+output "app_id" {
+  description = "Resource ID of the container app."
+  value       = azurerm_container_app.this.id
+}
+
 output "app_name" {
   description = "Name of the container app."
   value       = azurerm_container_app.this.name

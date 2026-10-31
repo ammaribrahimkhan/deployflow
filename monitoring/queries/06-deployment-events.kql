@@ -1,0 +1,6 @@
+AppEvents
+| where TimeGenerated > ago(__HOURS__h)
+| where Name in ('Deployment', 'Rollback')
+| extend p = Properties
+| project TimeGenerated, Name, environment = tostring(p.environment), outcome = tostring(p.outcome), shortSha = tostring(p.shortSha), revision = coalesce(tostring(p.candidateRevision), tostring(p.newRevision), tostring(p.targetRevision)), previousRevision = tostring(p.previousRevision), imageDigest = tostring(p.imageDigest), runUrl = tostring(p.deploymentRunUrl)
+| order by TimeGenerated desc

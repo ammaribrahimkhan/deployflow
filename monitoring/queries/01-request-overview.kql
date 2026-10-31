@@ -1,0 +1,10 @@
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(__HOURS__h)
+| where ContainerAppName_s == '__APP_NAME__'
+| where Log_s startswith '{'
+| extend j = parse_json(Log_s)
+| where isnotnull(j.status)
+| extend status = toint(j.status), path = tostring(j.path), durationMs = todouble(j.durationMs), gitSha = tostring(j.gitSha), revision = tostring(j.revision)
+| where path !startswith '/health'
+| summarize requests = count(), failed = countif(status >= 500), p50Ms = round(percentile(durationMs, 50), 1), p95Ms = round(percentile(durationMs, 95), 1), firstSeen = min(TimeGenerated), lastSeen = max(TimeGenerated) by revision, gitSha
+| order by lastSeen desc

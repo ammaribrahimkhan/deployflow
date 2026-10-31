@@ -1,8 +1,9 @@
-# DeployFlow rollback pipeline (Milestone 6)
+# DeployFlow rollback pipeline (Milestone 7)
 #
 # Manual only. Sends 100% of the production traffic back to an earlier revision.
 # Runs against the "production" environment, so it needs the same approval and branch check
-# as a release. Safe to run more than once (idempotent).
+# as a release. Safe to run more than once (idempotent). Every rollback is also recorded as an
+# event in Application Insights (best effort).
 #
 # Parameters (shown in the "Run pipeline" form):
 #   targetRevision : leave empty to go back to the previous revision
@@ -33,6 +34,8 @@ variables:
     value: ca-deployflow-prod
   - name: prodResourceGroup
     value: rg-deployflow-prod-eus2
+  - name: prodAppInsights
+    value: appi-deployflow-prod-eus2
 
 stages:
   - stage: Rollback
@@ -64,6 +67,19 @@ stages:
                     if ($LASTEXITCODE -ne 0) { exit 1 }
                   workingDirectory: $(Build.SourcesDirectory)
                   displayName: Smoke test production after the rollback
+
+                - task: AzureCLI@2
+                  displayName: Record the rollback event in Application Insights
+                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  continueOnError: true
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\send-deployment-event.ps1
+                    arguments: -AppInsightsName $(prodAppInsights) -ResourceGroup $(prodResourceGroup) -RecordPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json" -EnvironmentName production -EventName Rollback -JobStatus "$(Agent.JobStatus)" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
 
                 - publish: $(Build.ArtifactStagingDirectory)/rollback
                   artifact: rollback-record
