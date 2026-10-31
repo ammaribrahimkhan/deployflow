@@ -60,7 +60,8 @@ Write-Host "Currently serving: $($current.name) ($($current.traffic)%)"
 
 # 3. Which revision do we go back to?
 $target = $null
-if (-not ([string]::IsNullOrWhiteSpace($TargetRevision))) {
+if (-not ([string]::IsNullOrWhiteSpace($TargetRevision)) -and $TargetRevision.Trim() -ne "previous") {
+
   $target = $revisions | Where-Object { $_.name -eq $TargetRevision.Trim() } | Select-Object -First 1
   if (-not $target) { Fail "Revision '$TargetRevision' does not exist. Check the list above." }
 } else {
