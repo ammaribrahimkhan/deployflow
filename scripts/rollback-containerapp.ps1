@@ -46,7 +46,8 @@ if ($LASTEXITCODE -ne 0) { Fail "Could not list the revisions of $AppName" }
 $revisions = @(Flatten (ConvertFrom-Json $revText))
 if ($revisions.Count -eq 0) { Fail "No revisions found for $AppName" }
 
-$sorted = @($revisions | Sort-Object -Property created -Descending)
+# Explicitly cast 'created' to [DateTime] to make date comparison 100% accurate
+$sorted = @($revisions | Sort-Object -Property { [DateTime]$_.created } -Descending)
 Write-Host "Revisions (newest first):"
 $sorted | Format-Table name, active, traffic, created -AutoSize | Out-String -Width 250 | Write-Host
 
@@ -54,19 +55,26 @@ $fqdn = (az containerapp show --name $AppName --resource-group $ResourceGroup --
 Write-Host "##vso[task.setvariable variable=appUrl]https://$fqdn"
 
 # 2. Which revision serves the traffic now?
-$current = @($revisions | Sort-Object -Property @{ Expression = "traffic"; Descending = $true }, @{ Expression = "created"; Descending = $true }) | Select-Object -First 1
+$current = @($revisions | Sort-Object -Property @{ Expression = "traffic"; Descending = $true }, @{ Expression = { [DateTime]$_.created }; Descending = $true }) | Select-Object -First 1
 Write-Host "Currently serving: $($current.name) ($($current.traffic)%)"
 
 # 3. Which revision do we go back to?
 $target = $null
-if ($TargetRevision) {
-  $target = $revisions | Where-Object { $_.name -eq $TargetRevision } | Select-Object -First 1
+if (-not ([string]::IsNullOrWhiteSpace($TargetRevision))) {
+  $target = $revisions | Where-Object { $_.name -eq $TargetRevision.Trim() } | Select-Object -First 1
   if (-not $target) { Fail "Revision '$TargetRevision' does not exist. Check the list above." }
 } else {
-  $target = $sorted | Where-Object { $_.created -lt $current.created } | Select-Object -First 1
-  if (-not $target) { Fail "There is no earlier revision to roll back to." }
+  Write-Host "TargetRevision parameter is empty. Dynamically evaluating previous standby revision..."
+  # Look for the next available revision inside the existing list that is older than the current one
+  $target = $sorted | Where-Object { [DateTime]$_.created -lt [DateTime]$current.created } | Select-Object -First 1
+  
+  # Fallback: If no older one exists via time but there are 2 revisions present, pick index 1
+  if (-not $target -and $sorted.Count -gt 1) {
+      $target = $sorted[1]
+  }
+  if (-not $target) { Fail "There is no earlier available revision to roll back to in this subscription." }
 }
-Write-Host "Rollback target: $($target.name)"
+Write-Host "Rollback target safely resolved to: $($target.name)"
 
 $record = [ordered]@{
   appName          = $AppName

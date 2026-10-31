@@ -58,11 +58,19 @@ stages:
                     scriptType: ps
                     scriptLocation: scriptPath
                     scriptPath: $(Build.SourcesDirectory)\scripts\rollback-containerapp.ps1
-                    arguments: -AppName $(prodApp) -ResourceGroup $(prodResourceGroup) -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json" -TargetRevision "${{ parameters.targetRevision }}" -Reason "${{ parameters.reason }}" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    arguments: >
+                      -AppName "$(prodApp)"
+                      -ResourceGroup "$(prodResourceGroup)"
+                      -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json"
+                      -TargetRevision "${{ parameters.targetRevision }}"
+                      -Reason "${{ parameters.reason }}"
+                      -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
                     failOnStandardError: false
                     workingDirectory: $(Build.SourcesDirectory)
 
                 - powershell: |
+                    # Fetching the dynamically exposed App URL from preceding deployment context if applicable
+                    # If $(appUrl) isn't loaded globally, ensure it is set as a pipeline/environment variable.
                     & "$(Build.SourcesDirectory)\scripts\smoke-test.ps1" -BaseUrl "$(appUrl)" -ExpectedSha "" -ExpectedEnvironment "prod" -MaxP95Ms 5000 -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\smoke-after-rollback.json"
                     if ($LASTEXITCODE -ne 0) { exit 1 }
                   workingDirectory: $(Build.SourcesDirectory)
@@ -70,18 +78,25 @@ stages:
 
                 - task: AzureCLI@2
                   displayName: Record the rollback event in Application Insights
-                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  condition: always()
                   continueOnError: true
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: ps
                     scriptLocation: scriptPath
                     scriptPath: $(Build.SourcesDirectory)\scripts\send-deployment-event.ps1
-                    arguments: -AppInsightsName $(prodAppInsights) -ResourceGroup $(prodResourceGroup) -RecordPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json" -EnvironmentName production -EventName Rollback -JobStatus "$(Agent.JobStatus)" -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    arguments: >
+                      -AppInsightsName "$(prodAppInsights)"
+                      -ResourceGroup "$(prodResourceGroup)"
+                      -RecordPath "$(Build.ArtifactStagingDirectory)\rollback\rollback-record.json"
+                      -EnvironmentName production
+                      -EventName Rollback
+                      -JobStatus "$(Agent.JobStatus)"
+                      -RunUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
                     failOnStandardError: false
                     workingDirectory: $(Build.SourcesDirectory)
 
                 - publish: $(Build.ArtifactStagingDirectory)/rollback
                   artifact: rollback-record
-                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  condition: always()
                   displayName: Publish the rollback record
