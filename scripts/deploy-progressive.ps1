@@ -1,6 +1,5 @@
-
 # DeployFlow progressive production deployment.
-# Uses reusable HTTP connections, paired endpoint measurements,
+# Uses reusable HTTP connections, paired revision measurements,
 # baseline-aware latency gates, and independent live latency confirmation.
 
 param(
@@ -153,28 +152,27 @@ function Measure-Endpoint($url, $count) {
     return Convert-ProbeResults $results
 }
 
-function Measure-PairedEndpoints($mainUrl, $candidateUrl, $count) {
-    $mainResults = @()
-    $candidateResults = @()
+function Measure-PairedEndpoints($firstUrl, $secondUrl, $count) {
+    $firstResults = @()
+    $secondResults = @()
 
     for ($i = 1; $i -le $count; $i++) {
-        # Alternate which endpoint is measured first to reduce
-        # systematic timing bias between the two batches.
+        # Alternate measurement order to reduce systematic timing bias.
         if (($i % 2) -eq 1) {
-            $mainResults += Invoke-Probe $mainUrl
-            $candidateResults += Invoke-Probe $candidateUrl
+            $firstResults += Invoke-Probe $firstUrl
+            $secondResults += Invoke-Probe $secondUrl
         }
         else {
-            $candidateResults += Invoke-Probe $candidateUrl
-            $mainResults += Invoke-Probe $mainUrl
+            $secondResults += Invoke-Probe $secondUrl
+            $firstResults += Invoke-Probe $firstUrl
         }
 
         Start-Sleep -Milliseconds 250
     }
 
     return [pscustomobject]@{
-        Main      = Convert-ProbeResults $mainResults
-        Candidate = Convert-ProbeResults $candidateResults
+        First  = Convert-ProbeResults $firstResults
+        Second = Convert-ProbeResults $secondResults
     }
 }
 
@@ -381,7 +379,7 @@ Write-Host "Traffic rollout steps: $($stepList -join ', ')"
 Write-Host "Observation period: $ObserveSeconds seconds"
 Write-Host "Probes per step: $ProbesPerStep"
 Write-Host "HTTP connection reuse enabled."
-Write-Host "Candidate latency gate uses the production baseline."
+Write-Host "Production ingress and direct revision latency gates enabled."
 
 # ------------------------------------------------------------
 # 2. VALIDATE RELEASE METADATA
@@ -489,37 +487,41 @@ if (-not (Test-Path -LiteralPath $outDir)) {
 $stepResults = @()
 
 $record = [ordered]@{
-    environment                    = $EnvironmentName
-    appName                        = $AppName
-    resourceGroup                  = $ResourceGroup
-    imageReference                 = $imageRef
-    imageDigest                    = $digest
-    shortSha                       = $meta.shortSha
-    gitSha                         = $meta.gitSha
-    appVersion                     = $meta.appVersion
-    sourceBuildId                  = $meta.buildId
-    sourcePipelineRunUrl           = $meta.pipelineRunUrl
-    strategy                       = "progressive: $Steps"
-    observeSeconds                 = $ObserveSeconds
-    probesPerStep                  = $ProbesPerStep
-    injectFaultPercent             = $InjectFaultPercent
-    forceRedeploy                  = $force
-    baselineP95Ms                  = $null
-    maxLatencyIncreasePercent      = $MaxLatencyIncreasePercent
-    latencyConfirmationEnabled     = $true
+    environment                     = $EnvironmentName
+    appName                         = $AppName
+    resourceGroup                   = $ResourceGroup
+    imageReference                  = $imageRef
+    imageDigest                     = $digest
+    shortSha                        = $meta.shortSha
+    gitSha                          = $meta.gitSha
+    appVersion                      = $meta.appVersion
+    sourceBuildId                   = $meta.buildId
+    sourcePipelineRunUrl            = $meta.pipelineRunUrl
+    strategy                        = "progressive: $Steps"
+    observeSeconds                  = $ObserveSeconds
+    probesPerStep                   = $ProbesPerStep
+    injectFaultPercent              = $InjectFaultPercent
+    forceRedeploy                   = $force
+    baselineP95Ms                   = $null
+    oldRevisionBaselineP95Ms        = $null
+    maxLatencyIncreasePercent       = $MaxLatencyIncreasePercent
+    latencyConfirmationEnabled      = $true
     latencyConfirmationDelaySeconds = 10
-    measurementMethod              = "shared_http_client_alternating_endpoint_probes"
-    candidateLatencyGate           = "baseline_aware"
-    outcome                        = "started"
-    message                        = ""
-    previousRevision               = $null
-    previousImage                  = $null
-    candidateRevision              = $null
-    steps                          = @()
-    finalTraffic                   = @()
-    startedAtUtc                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    finishedAtUtc                  = $null
-    deploymentRunUrl               = $RunUrl
+    measurementMethod               = "production_ingress_plus_paired_direct_revision_probes"
+    productionLatencyGate           = "baseline_aware"
+    candidateLatencyGate            = "direct_revision_baseline_aware"
+    outcome                         = "started"
+    message                         = ""
+    previousRevision                = $null
+    previousImage                   = $null
+    previousRevisionFqdn             = $null
+    candidateRevision               = $null
+    candidateRevisionFqdn            = $null
+    steps                           = @()
+    finalTraffic                    = @()
+    startedAtUtc                    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    finishedAtUtc                   = $null
+    deploymentRunUrl                = $RunUrl
 }
 
 # ------------------------------------------------------------
@@ -568,23 +570,45 @@ if ([string]::IsNullOrWhiteSpace($old)) {
     Fail "Could not identify known-good production revision."
 }
 
-$oldImage = & az containerapp revision show `
+$oldRevisionText = & az containerapp revision show `
     --name $AppName `
     --resource-group $ResourceGroup `
     --revision $old `
-    --query "properties.template.containers[0].image" `
-    -o tsv
+    --query "{image:properties.template.containers[0].image,fqdn:properties.fqdn}" `
+    -o json
 
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($oldImage)) {
+if ($LASTEXITCODE -ne 0) {
+    Fail "Could not read known-good production revision."
+}
+
+try {
+    $oldRevisionInfo = $oldRevisionText | Out-String | ConvertFrom-Json
+}
+catch {
+    Fail "Could not parse known-good revision information."
+}
+
+$oldImage = [string]$oldRevisionInfo.image
+$oldFqdn = [string]$oldRevisionInfo.fqdn
+
+if ([string]::IsNullOrWhiteSpace($oldImage)) {
     Fail "Could not read known-good revision image."
 }
 
-$oldImage = ([string]$oldImage).Trim()
+if ([string]::IsNullOrWhiteSpace($oldFqdn)) {
+    Fail "Could not retrieve the known-good revision FQDN. No traffic was changed."
+}
+
+$oldImage = $oldImage.Trim()
+$oldFqdn = $oldFqdn.Trim()
+$oldUrl = "https://$oldFqdn"
 
 $record.previousRevision = $old
 $record.previousImage = $oldImage
+$record.previousRevisionFqdn = $oldFqdn
 
 Write-Host "Known-good revision: $old"
+Write-Host "Known-good revision URL: $oldUrl"
 Write-Host "Known-good image: $oldImage"
 Write-Host "Release image: $imageRef"
 
@@ -598,7 +622,7 @@ if (($oldImage -eq $imageRef) -and (-not $force)) {
 }
 
 # ------------------------------------------------------------
-# 8. WARM PRODUCTION AND MEASURE BASELINE
+# 8. WARM PRODUCTION AND MEASURE BOTH BASELINES
 # ------------------------------------------------------------
 
 Write-Host ""
@@ -608,17 +632,27 @@ if (-not (Wait-ForWarm $mainUrl $WarmupSeconds)) {
     Fail "Production did not respond successfully within $WarmupSeconds seconds. No traffic was changed."
 }
 
-Write-Host "Production is warm."
+Write-Host "Production ingress is warm."
 
 Write-Host ""
-Write-Host "=== Measuring existing production baseline ==="
+Write-Host "=== Warming up known-good revision directly ==="
+
+if (-not (Wait-ForWarm $oldUrl $WarmupSeconds)) {
+    Fail "Known-good revision direct endpoint did not respond successfully. No traffic was changed."
+}
+
+Write-Host "Known-good revision is warm."
+
+# Measure normal production ingress baseline.
+Write-Host ""
+Write-Host "=== Measuring production ingress baseline ==="
 
 $baseline = $null
 
 for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
     $baseline = Measure-Endpoint $mainUrl $ProbesPerStep
 
-    Write-Host "Baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
+    Write-Host "Production baseline attempt ${attempt}: $($baseline.Count) probes, $($baseline.Errors) errors ($($baseline.ErrorPercent)%)"
 
     if ($baseline.ErrorPercent -le $MaxErrorRatePercent) {
         break
@@ -629,30 +663,63 @@ for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
         Where-Object { -not $_.Ok } |
         Select-Object -First 3
     )) {
-        Write-Host "Failed probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
+        Write-Host "Failed production probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
     }
 
     if ($attempt -lt $BaselineAttempts) {
-        Write-Host "Baseline error rate is above the configured limit. Waiting 15 seconds."
+        Write-Host "Production baseline error rate is above the configured limit. Waiting 15 seconds."
         Start-Sleep -Seconds 15
     }
 }
 
 if ($baseline.ErrorPercent -gt $MaxErrorRatePercent) {
-    Fail "Existing production baseline stayed above $MaxErrorRatePercent% errors. Fix production health before starting a canary."
+    Fail "Production baseline stayed above $MaxErrorRatePercent% errors. Fix production health before starting a canary."
 }
 
-$okLatencies = @(
-    $baseline.Results |
-    Where-Object { $_.Ok } |
-    ForEach-Object { $_.Ms }
-)
-
-$baselineP95 = Get-P95 $okLatencies
+$baselineP95 = $baseline.P95
 
 $record.baselineP95Ms = $baselineP95
 
-Write-Host "Production baseline: $($okLatencies.Count) successful probes, p95 $baselineP95 ms"
+Write-Host "Production ingress baseline: $($baseline.Count) probes, p95 $baselineP95 ms"
+
+# Measure known-good revision directly.
+Write-Host ""
+Write-Host "=== Measuring known-good revision direct baseline ==="
+
+$oldBaseline = $null
+
+for ($attempt = 1; $attempt -le $BaselineAttempts; $attempt++) {
+    $oldBaseline = Measure-Endpoint $oldUrl $ProbesPerStep
+
+    Write-Host "Known-good direct baseline attempt ${attempt}: $($oldBaseline.Count) probes, $($oldBaseline.Errors) errors ($($oldBaseline.ErrorPercent)%)"
+
+    if ($oldBaseline.ErrorPercent -le $MaxErrorRatePercent) {
+        break
+    }
+
+    foreach ($failedProbe in @(
+        $oldBaseline.Results |
+        Where-Object { -not $_.Ok } |
+        Select-Object -First 3
+    )) {
+        Write-Host "Failed known-good direct probe after $($failedProbe.Ms) ms: $($failedProbe.Error)"
+    }
+
+    if ($attempt -lt $BaselineAttempts) {
+        Write-Host "Known-good direct endpoint error rate is above the configured limit. Waiting 15 seconds."
+        Start-Sleep -Seconds 15
+    }
+}
+
+if ($oldBaseline.ErrorPercent -gt $MaxErrorRatePercent) {
+    Fail "Known-good revision direct baseline stayed above $MaxErrorRatePercent% errors. No deployment traffic was changed."
+}
+
+$oldRevisionBaselineP95 = $oldBaseline.P95
+
+$record.oldRevisionBaselineP95Ms = $oldRevisionBaselineP95
+
+Write-Host "Known-good direct baseline: $($oldBaseline.Count) probes, p95 $oldRevisionBaselineP95 ms"
 
 # ------------------------------------------------------------
 # 9. PIN KNOWN-GOOD REVISION TO 100%
@@ -718,6 +785,8 @@ if (
 
 $candUrl = "https://$($cand.fqdn)"
 
+$record.candidateRevisionFqdn = [string]$cand.fqdn
+
 Write-Host "Candidate revision: $new"
 Write-Host "Candidate URL: $candUrl"
 
@@ -734,6 +803,7 @@ Write-Host "=== Candidate pre-traffic smoke test ==="
     -ExpectedEnvironment $ExpectedEnvironment `
     -MaxP95Ms $PreTrafficMaxP95Ms `
     -OutputPath (Join-Path $outDir "smoke-candidate-production.json")
+
 $smokeSucceeded = $?
 
 if (-not $smokeSucceeded) {
@@ -793,39 +863,70 @@ foreach ($weight in $stepList) {
 
     Start-Sleep -Seconds $ObserveSeconds
 
-    # Warm both endpoints before measuring.
+    # Warm all three endpoints before measuring.
     for ($w = 1; $w -le 4; $w++) {
         $null = Invoke-Probe "$mainUrl/"
+        $null = Invoke-Probe "$oldUrl/"
         $null = Invoke-Probe "$candUrl/"
     }
 
-    # Alternate live and candidate probes to reduce measurement-order bias.
-    $paired = Measure-PairedEndpoints $mainUrl $candUrl $ProbesPerStep
+    # Measure old and candidate directly as a paired comparison.
+    Write-Host ""
+    Write-Host "Measuring known-good and candidate revision endpoints..."
 
-    $main = $paired.Main
-    $candidate = $paired.Candidate
+    $paired = Measure-PairedEndpoints $oldUrl $candUrl $ProbesPerStep
+
+    $oldDirect = $paired.First
+    $candidate = $paired.Second
+
+    # Measure the normal production ingress separately.
+    Write-Host "Measuring normal production ingress..."
+
+    $main = Measure-Endpoint $mainUrl $ProbesPerStep
 
     $mainP95 = $main.P95
+    $oldDirectP95 = $oldDirect.P95
     $candP95 = $candidate.P95
 
     $mainErrorPercent = $main.ErrorPercent
+    $oldDirectErrorPercent = $oldDirect.ErrorPercent
     $candErrorPercent = $candidate.ErrorPercent
 
-    $allowedBaselineP95 = [math]::Ceiling(
+    # Production ingress limit is based on production ingress baseline.
+    $allowedProductionBaselineP95 = [math]::Ceiling(
         $baselineP95 * (1 + ($MaxLatencyIncreasePercent / 100.0))
     )
 
     $effectiveLiveLimit = [math]::Min(
         $CanaryMaxP95Ms,
-        $allowedBaselineP95
+        $allowedProductionBaselineP95
     )
 
-    Write-Host "Baseline p95: $baselineP95 ms"
-    Write-Host "Effective live and candidate p95 limit: $effectiveLiveLimit ms"
+    # Candidate direct limit is based on known-good direct revision baseline.
+    $allowedOldRevisionBaselineP95 = [math]::Ceiling(
+        $oldRevisionBaselineP95 * (1 + ($MaxLatencyIncreasePercent / 100.0))
+    )
 
-    Write-Host "Live endpoint: $($main.Count) probes, $($main.Errors) errors ($mainErrorPercent%), p95 $mainP95 ms"
+    $effectiveCandidateLimit = [math]::Min(
+        $CanaryMaxP95Ms,
+        $allowedOldRevisionBaselineP95
+    )
 
-    Write-Host "Candidate endpoint: $($candidate.Count) probes, $($candidate.Errors) errors ($candErrorPercent%), p95 $candP95 ms"
+    Write-Host ""
+    Write-Host "=== LATENCY MEASUREMENTS ==="
+
+    Write-Host "Production ingress baseline p95: $baselineP95 ms"
+    Write-Host "Known-good direct baseline p95: $oldRevisionBaselineP95 ms"
+
+    Write-Host "Production ingress p95 limit: $effectiveLiveLimit ms"
+    Write-Host "Candidate direct p95 limit: $effectiveCandidateLimit ms"
+
+    Write-Host ""
+    Write-Host "Production ingress: $($main.Count) probes, $($main.Errors) errors ($mainErrorPercent%), p95 $mainP95 ms"
+
+    Write-Host "Known-good direct endpoint: $($oldDirect.Count) probes, $($oldDirect.Errors) errors ($oldDirectErrorPercent%), p95 $oldDirectP95 ms"
+
+    Write-Host "Candidate direct endpoint: $($candidate.Count) probes, $($candidate.Errors) errors ($candErrorPercent%), p95 $candP95 ms"
 
     # --------------------------------------------------------
     # LATENCY CONFIRMATION AND ROLLOUT GATES
@@ -839,23 +940,27 @@ foreach ($weight in $stepList) {
 
     # Error-rate breaches remain immediate failures.
     if ($mainErrorPercent -gt $MaxErrorRatePercent) {
-        $breaches += "Live error rate $mainErrorPercent% exceeds $MaxErrorRatePercent%."
+        $breaches += "Production ingress error rate $mainErrorPercent% exceeds $MaxErrorRatePercent%."
+    }
+
+    if ($oldDirectErrorPercent -gt $MaxErrorRatePercent) {
+        $breaches += "Known-good direct endpoint error rate $oldDirectErrorPercent% exceeds $MaxErrorRatePercent%."
     }
 
     if ($candErrorPercent -gt $MaxErrorRatePercent) {
         $breaches += "Candidate error rate $candErrorPercent% exceeds $MaxErrorRatePercent%."
     }
 
-    # Confirm a live latency breach using a separate probe batch.
+    # Confirm a production ingress latency breach independently.
     if ($mainP95 -gt $effectiveLiveLimit) {
         if ($mainErrorPercent -gt $MaxErrorRatePercent) {
             $mainLatencyConfirmationResult = "skipped_live_errors"
 
-            $breaches += "Live latency exceeded its limit and the live error rate also breached its limit."
+            $breaches += "Production ingress latency exceeded its limit and the production ingress error rate also breached its limit."
         }
         else {
             Write-Host ""
-            Write-Host "WARNING: Live p95 exceeded its limit."
+            Write-Host "WARNING: Production ingress p95 exceeded its limit."
             Write-Host "Waiting 10 seconds before independent confirmation."
 
             Start-Sleep -Seconds 10
@@ -865,29 +970,29 @@ foreach ($weight in $stepList) {
             $mainLatencyConfirmationP95 = $confirmation.P95
             $mainLatencyConfirmationErrors = $confirmation.ErrorPercent
 
-            Write-Host "Latency confirmation: $($confirmation.Count) probes, $($confirmation.Errors) errors ($($confirmation.ErrorPercent)%), p95 $($confirmation.P95) ms"
+            Write-Host "Production latency confirmation: $($confirmation.Count) probes, $($confirmation.Errors) errors ($($confirmation.ErrorPercent)%), p95 $($confirmation.P95) ms"
 
             if ($confirmation.ErrorPercent -gt $MaxErrorRatePercent) {
                 $mainLatencyConfirmationResult = "failed_errors"
 
-                $breaches += "Latency confirmation error rate $($confirmation.ErrorPercent)% exceeds $MaxErrorRatePercent%."
+                $breaches += "Production latency confirmation error rate $($confirmation.ErrorPercent)% exceeds $MaxErrorRatePercent%."
             }
             elseif ($confirmation.P95 -gt $effectiveLiveLimit) {
                 $mainLatencyConfirmationResult = "confirmed_breach"
 
-                $breaches += "Live p95 breach confirmed: first batch $mainP95 ms and confirmation $($confirmation.P95) ms both exceed $effectiveLiveLimit ms."
+                $breaches += "Production ingress p95 breach confirmed: first batch $mainP95 ms and confirmation $($confirmation.P95) ms both exceed $effectiveLiveLimit ms."
             }
             else {
                 $mainLatencyConfirmationResult = "passed"
 
-                Write-Host "Latency confirmation passed. Treating the first high-p95 measurement as a transient spike."
+                Write-Host "Production latency confirmation passed. Treating the first high-p95 measurement as a transient spike."
             }
         }
     }
 
-    # Candidate latency breaches are immediate and use the same baseline-aware limit.
-    if ($candP95 -gt $effectiveLiveLimit) {
-        $breaches += "Candidate p95 $candP95 ms exceeds baseline-aware limit $effectiveLiveLimit ms."
+    # Candidate direct endpoint is compared against the known-good direct baseline.
+    if ($candP95 -gt $effectiveCandidateLimit) {
+        $breaches += "Candidate direct p95 $candP95 ms exceeds its direct-baseline-aware limit $effectiveCandidateLimit ms."
     }
 
     $resultText = "pass"
@@ -897,22 +1002,33 @@ foreach ($weight in $stepList) {
     }
 
     $stepResults += [ordered]@{
-        step                          = $stepNumber
-        trafficToCandidatePercent     = $weight
-        baselineP95Ms                 = $baselineP95
-        effectiveLiveLimitMs          = $effectiveLiveLimit
-        effectiveCandidateLimitMs     = $effectiveLiveLimit
-        liveProbes                    = $main.Count
-        liveErrorPercent              = $mainErrorPercent
-        liveP95Ms                     = $mainP95
-        mainLatencyConfirmationP95Ms  = $mainLatencyConfirmationP95
-        mainLatencyConfirmationErrors = $mainLatencyConfirmationErrors
-        mainLatencyConfirmationResult = $mainLatencyConfirmationResult
-        candidateProbes               = $candidate.Count
-        candidateErrorPercent         = $candErrorPercent
-        candidateP95Ms                = $candP95
-        result                        = $resultText
-        breaches                      = $breaches
+        step                            = $stepNumber
+        trafficToCandidatePercent       = $weight
+
+        productionBaselineP95Ms         = $baselineP95
+        knownGoodDirectBaselineP95Ms    = $oldRevisionBaselineP95
+
+        effectiveLiveLimitMs            = $effectiveLiveLimit
+        effectiveCandidateLimitMs       = $effectiveCandidateLimit
+
+        liveProbes                      = $main.Count
+        liveErrorPercent                = $mainErrorPercent
+        liveP95Ms                       = $mainP95
+
+        knownGoodDirectProbes           = $oldDirect.Count
+        knownGoodDirectErrorPercent     = $oldDirectErrorPercent
+        knownGoodDirectP95Ms            = $oldDirectP95
+
+        mainLatencyConfirmationP95Ms    = $mainLatencyConfirmationP95
+        mainLatencyConfirmationErrors   = $mainLatencyConfirmationErrors
+        mainLatencyConfirmationResult   = $mainLatencyConfirmationResult
+
+        candidateProbes                 = $candidate.Count
+        candidateErrorPercent           = $candErrorPercent
+        candidateP95Ms                  = $candP95
+
+        result                          = $resultText
+        breaches                        = $breaches
     }
 
     if ($breaches.Count -gt 0) {
