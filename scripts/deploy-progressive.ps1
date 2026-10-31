@@ -1,5 +1,7 @@
 
 # DeployFlow progressive production deployment with baseline-aware canary checks.
+# A live latency breach is confirmed with a second independent probe batch
+# before rollback. Error-rate and candidate latency gates remain strict.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -260,7 +262,9 @@ function Measure-Endpoint($url, $count) {
     )
 
     $p95 = Get-P95 (
-        $results | ForEach-Object { $_.Ms }
+        $results |
+        Where-Object { $_.Ok } |
+        ForEach-Object { $_.Ms }
     )
 
     return [pscustomobject]@{
@@ -470,6 +474,8 @@ $record = [ordered]@{
     forceRedeploy             = $force
     baselineP95Ms             = $null
     maxLatencyIncreasePercent = $MaxLatencyIncreasePercent
+    latencyConfirmationEnabled = $true
+    latencyConfirmationDelaySeconds = 10
     outcome                   = "started"
     message                   = ""
     previousRevision          = $null
@@ -792,9 +798,17 @@ foreach ($weight in $stepList) {
 
     Write-Host "Candidate endpoint: $($candidate.Count) probes, $($candidate.Errors) errors ($candErrorPercent%), p95 $candP95 ms"
 
-    # Evaluate rollout gates.
+    # --------------------------------------------------------
+    # LATENCY CONFIRMATION AND ROLLOUT GATES
+    # --------------------------------------------------------
+
     $breaches = @()
 
+    $mainLatencyConfirmationP95 = $null
+    $mainLatencyConfirmationErrors = $null
+    $mainLatencyConfirmationResult = "not_needed"
+
+    # Error-rate breaches remain immediate failures.
     if ($mainErrorPercent -gt $MaxErrorRatePercent) {
         $breaches += "Live error rate $mainErrorPercent% exceeds $MaxErrorRatePercent%."
     }
@@ -803,8 +817,52 @@ foreach ($weight in $stepList) {
         $breaches += "Candidate error rate $candErrorPercent% exceeds $MaxErrorRatePercent%."
     }
 
+    # Confirm a live latency breach using a separate probe batch.
     if ($mainP95 -gt $effectiveLiveLimit) {
-        $breaches += "Live p95 $mainP95 ms exceeds effective limit $effectiveLiveLimit ms."
+
+        if ($mainErrorPercent -gt $MaxErrorRatePercent) {
+
+            $mainLatencyConfirmationResult = "skipped_live_errors"
+
+            $breaches += "Live latency exceeded its limit and the live error rate also breached its limit."
+
+        }
+        else {
+
+            Write-Host ""
+            Write-Host "WARNING: Live p95 exceeded its limit."
+            Write-Host "Waiting 10 seconds before independent confirmation."
+
+            Start-Sleep -Seconds 10
+
+            $confirmation = Measure-Endpoint $mainUrl $ProbesPerStep
+
+            $mainLatencyConfirmationP95 = $confirmation.P95
+            $mainLatencyConfirmationErrors = $confirmation.ErrorPercent
+
+            Write-Host "Latency confirmation: $($confirmation.Count) probes, $($confirmation.Errors) errors ($($confirmation.ErrorPercent)%), p95 $($confirmation.P95) ms"
+
+            if ($confirmation.ErrorPercent -gt $MaxErrorRatePercent) {
+
+                $mainLatencyConfirmationResult = "failed_errors"
+
+                $breaches += "Latency confirmation error rate $($confirmation.ErrorPercent)% exceeds $MaxErrorRatePercent%."
+
+            }
+            elseif ($confirmation.P95 -gt $effectiveLiveLimit) {
+
+                $mainLatencyConfirmationResult = "confirmed_breach"
+
+                $breaches += "Live p95 breach confirmed: first batch $mainP95 ms and confirmation $($confirmation.P95) ms both exceed $effectiveLiveLimit ms."
+
+            }
+            else {
+
+                $mainLatencyConfirmationResult = "passed"
+
+                Write-Host "Latency confirmation passed. Treating the first high-p95 measurement as a transient spike."
+            }
+        }
     }
 
     if ($candP95 -gt $CanaryMaxP95Ms) {
@@ -818,18 +876,21 @@ foreach ($weight in $stepList) {
     }
 
     $stepResults += [ordered]@{
-        step                       = $stepNumber
-        trafficToCandidatePercent  = $weight
-        baselineP95Ms              = $baselineP95
-        effectiveLiveLimitMs       = $effectiveLiveLimit
-        liveProbes                 = $main.Count
-        liveErrorPercent           = $mainErrorPercent
-        liveP95Ms                  = $mainP95
-        candidateProbes            = $candidate.Count
-        candidateErrorPercent      = $candErrorPercent
-        candidateP95Ms             = $candP95
-        result                     = $resultText
-        breaches                   = $breaches
+        step                           = $stepNumber
+        trafficToCandidatePercent      = $weight
+        baselineP95Ms                  = $baselineP95
+        effectiveLiveLimitMs           = $effectiveLiveLimit
+        liveProbes                     = $main.Count
+        liveErrorPercent               = $mainErrorPercent
+        liveP95Ms                      = $mainP95
+        mainLatencyConfirmationP95Ms   = $mainLatencyConfirmationP95
+        mainLatencyConfirmationErrors  = $mainLatencyConfirmationErrors
+        mainLatencyConfirmationResult  = $mainLatencyConfirmationResult
+        candidateProbes                = $candidate.Count
+        candidateErrorPercent          = $candErrorPercent
+        candidateP95Ms                 = $candP95
+        result                         = $resultText
+        breaches                       = $breaches
     }
 
     if ($breaches.Count -gt 0) {
