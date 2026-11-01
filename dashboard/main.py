@@ -1,3 +1,4 @@
+
 """DeployFlow dashboard: a small Flask service that reads real data from Azure and Azure DevOps.
 
 Security design:
@@ -561,6 +562,9 @@ DEPLOYMENT_KQL = (
     "revision = coalesce(tostring(p.candidateRevision), tostring(p.newRevision), tostring(p.targetRevision)), "
     "previousRevision = tostring(p.previousRevision), "
     "imageDigest = tostring(p.imageDigest), "
+    "scannedImage = tostring(p.scannedImage), "
+    "scannedImageDigest = tostring(p.scannedImageDigest), "
+    "scannedImageReference = tostring(p.scannedImageReference), "
     "runUrl = coalesce(tostring(p.deploymentRunUrl), tostring(p.rollbackRunUrl), tostring(p.pipelineRunUrl)), "
     "gateResult = tostring(p.gateResult), "
     "criticalCount = tostring(p.criticalCount), "
@@ -722,6 +726,9 @@ def security():
             "highCount": event["highCount"],
             "trivyVersion": event["trivyVersion"],
             "sbomSha256": event["sbomSha256"],
+            "scannedImage": event["scannedImage"],
+            "scannedImageDigest": event["scannedImageDigest"],
+            "scannedImageReference": event["scannedImageReference"],
         }
         for key, event in latest.items()
     ]

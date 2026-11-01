@@ -1,3 +1,4 @@
+
 """Pure functions that turn raw Azure data into what the dashboard shows."""
 import re
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ FAILURE_OUTCOMES = {
     "failed_before_traffic",
     "rollback_failed",
 }
-WARNING_OUTCOMES = {"promoted_with_cleanup_warning", "rolled_back"}
+WARNING_OUTCOMES = {"promoted_with_cleanup_warning"}
 
 _TIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})")
 REASON_PATTERN = re.compile(r"^[A-Za-z0-9 .,_:;()/\-]{3,100}$")
@@ -72,10 +73,9 @@ def classify_event(event):
             return "rollback"
         return "unknown"
 
-    # The deployment attempt did not remain live, but recovery occurred.
-    # Keep it visible as a warning/incident, not as a failed rollback.
+    # An automatically rolled-back deployment is unsuccessful.
     if name == "Deployment" and outcome == "rolled_back":
-        return "warning"
+        return "failure"
 
     if outcome in SUCCESS_OUTCOMES:
         return "success"
@@ -100,6 +100,9 @@ def normalize_event(row, env_key):
         "revision": row.get("revision") or "",
         "previousRevision": row.get("previousRevision") or "",
         "imageDigest": row.get("imageDigest") or "",
+        "scannedImage": row.get("scannedImage") or "",
+        "scannedImageDigest": row.get("scannedImageDigest") or "",
+        "scannedImageReference": row.get("scannedImageReference") or "",
         "runUrl": safe_https(row.get("runUrl")),
         "gateResult": row.get("gateResult") or "",
         "criticalCount": _to_int(row.get("criticalCount")),
@@ -138,7 +141,7 @@ def deployment_stats(events):
 
     # Count automatically rolled-back deployment attempts as unsuccessful
     # deployment attempts, while keeping successful recovery separate.
-    judged = counts["success"] + counts["failure"] + automatic
+    judged = counts["success"] + counts["failure"]
 
     rate = (
         round(100.0 * counts["success"] / judged, 1)
@@ -149,7 +152,7 @@ def deployment_stats(events):
     return {
         "deployments": judged,
         "succeeded": counts["success"],
-        "failed": counts["failure"] + automatic,
+        "failed": counts["failure"],
         "rollbacks": counts["rollback"] + automatic,
         "automaticRollbacks": automatic,
         "manualRollbacks": counts["rollback"],

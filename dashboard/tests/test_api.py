@@ -19,13 +19,30 @@ def client(monkeypatch):
 @pytest.fixture
 def queued(monkeypatch):
     calls = []
-    monkeypatch.setattr(main.azure_api, "pipeline_ids", lambda: {"deployflow-rollback": 7, "deployflow-cd": 5})
+
+    monkeypatch.setattr(
+        main.azure_api,
+        "pipeline_ids",
+        lambda: {
+            "deployflow-rollback": 7,
+            "deployflow-cd": 5,
+        },
+    )
 
     def fake_queue(pipeline_id, parameters):
         calls.append((pipeline_id, parameters))
-        return {"id": 99, "_links": {"web": {"href": "https://dev.azure.com/org/project/_build/results?buildId=99"}}}
+
+        return {
+            "id": 99,
+            "_links": {
+                "web": {
+                    "href": "https://dev.azure.com/org/project/_build/results?buildId=99"
+                }
+            },
+        }
 
     monkeypatch.setattr(main.azure_api, "queue_pipeline", fake_queue)
+
     return calls
 
 
@@ -49,26 +66,33 @@ def test_wrong_token_is_rejected(client):
 
 def test_viewer_sign_in(client):
     sign_in(client, "viewer")
+
     body = client.get("/api/me").get_json()
+
     assert body["role"] == "viewer"
     assert body["actionsEnabled"] is True
 
 
 def test_admin_sign_in(client):
     sign_in(client, "admin")
+
     assert client.get("/api/me").get_json()["role"] == "admin"
 
 
 def test_index_page_is_served_after_sign_in(client):
     sign_in(client, "viewer")
+
     response = client.get("/")
+
     assert response.status_code == 200
     assert b"DeployFlow dashboard" in response.data
 
 
 def test_security_headers_are_set(client):
     sign_in(client, "viewer")
+
     response = client.get("/api/me")
+
     assert "default-src 'self'" in response.headers["Content-Security-Policy"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Cache-Control"] == "no-store"
@@ -81,43 +105,120 @@ def test_unexpected_problems_come_back_as_readable_json(client, monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(main.azure_api, "pipeline_ids", boom)
+
     response = client.get("/api/pipelines")
+
     assert response.status_code == 500
     assert "unexpected problem" in response.get_json()["error"].lower()
 
 
+def test_security_api_returns_scanned_image_metadata(client, monkeypatch):
+    sign_in(client, "viewer")
+
+    monkeypatch.setattr(
+        main,
+        "load_deployment_events",
+        lambda: {
+            "events": [
+                {
+                    "env": "production",
+                    "time": "2026-11-01T10:00:00Z",
+                    "shortSha": "abc1234",
+                    "gateResult": "passed",
+                    "criticalCount": 0,
+                    "highCount": 0,
+                    "trivyVersion": "0.73.0",
+                    "sbomSha256": "sbom123",
+                    "scannedImage": "abc1234",
+                    "scannedImageDigest": "sha256:123456",
+                    "scannedImageReference": (
+                        "acr.azurecr.io/deployflow-app@sha256:123456"
+                    ),
+                }
+            ]
+        },
+    )
+
+    monkeypatch.setattr(main, "blocked_releases", lambda: [])
+
+    response = client.get("/api/security")
+
+    assert response.status_code == 200
+
+    scan = response.get_json()["latestScans"][0]
+
+    assert scan["scannedImage"] == "abc1234"
+    assert scan["scannedImageDigest"] == "sha256:123456"
+    assert scan["scannedImageReference"] == (
+        "acr.azurecr.io/deployflow-app@sha256:123456"
+    )
+
+
 def test_viewer_cannot_start_actions(client, queued):
     sign_in(client, "viewer")
-    response = client.post("/api/actions/rollback", json={"reason": "valid reason"}, headers=CSRF)
+
+    response = client.post(
+        "/api/actions/rollback",
+        json={"reason": "valid reason"},
+        headers=CSRF,
+    )
+
     assert response.status_code == 403
     assert queued == []
 
 
 def test_actions_can_be_switched_off(client, queued, monkeypatch):
     monkeypatch.setattr(config, "ACTIONS_ENABLED", False)
+
     sign_in(client, "admin")
-    response = client.post("/api/actions/rollback", json={"reason": "valid reason"}, headers=CSRF)
+
+    response = client.post(
+        "/api/actions/rollback",
+        json={"reason": "valid reason"},
+        headers=CSRF,
+    )
+
     assert response.status_code == 403
     assert queued == []
 
 
 def test_missing_csrf_header_is_rejected(client, queued):
     sign_in(client, "admin")
-    response = client.post("/api/actions/rollback", json={"reason": "valid reason"})
+
+    response = client.post(
+        "/api/actions/rollback",
+        json={"reason": "valid reason"},
+    )
+
     assert response.status_code == 403
     assert queued == []
 
 
 def test_invalid_reason_is_rejected(client, queued):
     sign_in(client, "admin")
-    response = client.post("/api/actions/rollback", json={"reason": 'bad "quote"'}, headers=CSRF)
+
+    response = client.post(
+        "/api/actions/rollback",
+        json={"reason": 'bad "quote"'},
+        headers=CSRF,
+    )
+
     assert response.status_code == 400
     assert queued == []
 
 
 def test_valid_rollback_is_queued(client, queued):
     sign_in(client, "admin")
-    response = client.post("/api/actions/rollback", json={"targetRevision": "", "reason": "Bad release"}, headers=CSRF)
+
+    response = client.post(
+        "/api/actions/rollback",
+        json={
+            "targetRevision": "",
+            "reason": "Bad release",
+        },
+        headers=CSRF,
+    )
+
     assert response.status_code == 200
     assert response.get_json()["runId"] == 99
     assert queued == [(7, {"targetRevision": "", "reason": "Bad release"})]
@@ -125,7 +226,18 @@ def test_valid_rollback_is_queued(client, queued):
 
 def test_deploy_request_needs_explicit_confirmation(client, queued):
     sign_in(client, "admin")
-    assert client.post("/api/actions/deploy", json={}, headers=CSRF).status_code == 400
-    response = client.post("/api/actions/deploy", json={"confirm": True}, headers=CSRF)
+
+    assert client.post(
+        "/api/actions/deploy",
+        json={},
+        headers=CSRF,
+    ).status_code == 400
+
+    response = client.post(
+        "/api/actions/deploy",
+        json={"confirm": True},
+        headers=CSRF,
+    )
+
     assert response.status_code == 200
     assert queued == [(5, None)]

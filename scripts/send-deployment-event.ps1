@@ -183,6 +183,14 @@ try {
                     $properties["scannedImage"] = [string]$meta.security.scannedImage
                 }
 
+if ($meta.security.scannedImageDigest) {
+    $properties["scannedImageDigest"] = [string]$meta.security.scannedImageDigest
+}
+
+if ($meta.security.scannedImageReference) {
+    $properties["scannedImageReference"] = [string]$meta.security.scannedImageReference
+}
+
                 if ($meta.security.severityThreshold) {
                     $properties["severityThreshold"] = [string]$meta.security.severityThreshold
                 }

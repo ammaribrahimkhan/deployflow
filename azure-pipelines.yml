@@ -569,9 +569,23 @@ stages:
 
               # Read security evidence.
 
-              $security = Get-Content `
-                (Join-Path $reports "security-summary.json") `
-                -Raw | ConvertFrom-Json
+   $security = Get-Content `
+  (Join-Path $reports "security-summary.json") `
+  -Raw | ConvertFrom-Json
+
+# Bind the Trivy scan evidence to the immutable image pushed to ACR.
+$security | Add-Member `
+  -NotePropertyName scannedImageDigest `
+  -NotePropertyValue $digest `
+  -Force
+
+$security | Add-Member `
+  -NotePropertyName scannedImageReference `
+  -NotePropertyValue ("{0}@{1}" -f $image, $digest) `
+  -Force
+
+Write-Host "Scanned image digest: $($security.scannedImageDigest)"
+Write-Host "Scanned image reference: $($security.scannedImageReference)"
 
               # Create release metadata.
 

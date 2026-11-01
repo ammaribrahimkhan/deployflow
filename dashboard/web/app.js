@@ -1,4 +1,3 @@
-
 "use strict";
 
 const { useState, useEffect, useCallback } = React;
@@ -36,9 +35,6 @@ function shortDigest(value) {
 function percent(value) {
   return value === null || value === undefined ? "-" : value + "%";
 }
-
-// General status classification.
-// Event-specific rollback classification is handled separately below.
 
 function kindOf(text) {
   const value = String(text || "").toLowerCase();
@@ -78,10 +74,6 @@ function kindOf(text) {
 
   return "muted";
 }
-
-// Classify deployment outcome using BOTH event name and outcome.
-// This prevents successful rollback operations and recovered deployment
-// incidents from being confused with failed rollback operations.
 
 function deploymentOutcome(event) {
   const name = String(event.name || "").toLowerCase();
@@ -136,9 +128,6 @@ function deploymentOutcome(event) {
     kind: kindOf(outcome)
   };
 }
-
-// One place that talks to the dashboard server and turns every kind
-// of failure into a clear message.
 
 async function fetchJson(path, options) {
   let response;
@@ -254,8 +243,6 @@ function Kpi({ label, value, hint }) {
       <div className="hint">${hint || ""}</div>
     </div>`;
 }
-
-// Checks every 10 seconds that the dashboard server itself is alive.
 
 function ServerBanner({ onRecovered }) {
   const [down, setDown] = useState(false);
@@ -451,7 +438,26 @@ function DeploymentsTable({ events }) {
 
 // ---------------------------------------------------------------- security, SLO, alerts
 
-function SecurityBody({ data }) {
+function scanImageMatch(scan, environments) {
+  const items = environments && environments.environments
+    ? environments.environments
+    : [];
+
+  const live = items.find((item) => item.key === scan.env);
+
+  const scannedDigest = (scan.scannedImageDigest || "").toLowerCase();
+  const liveDigest = (
+    live && live.imageDigest ? live.imageDigest : ""
+  ).toLowerCase();
+
+  if (!scannedDigest || !liveDigest) {
+    return "UNVERIFIED";
+  }
+
+  return scannedDigest === liveDigest ? "MATCH" : "MISMATCH";
+}
+
+function SecurityBody({ data, environments }) {
   return html`
     <div>
       <h3 className="muted">Latest scan of the deployed image</h3>
@@ -469,6 +475,8 @@ function SecurityBody({ data }) {
                   <th>High</th>
                   <th>Commit</th>
                   <th>Scanner</th>
+                  <th>Scanned image</th>
+                  <th>Live image match</th>
                   <th>SBOM hash</th>
                   <th>Scanned</th>
                 </tr>
@@ -480,8 +488,14 @@ function SecurityBody({ data }) {
                     <td><${Badge} kind=${kindOf(scan.gateResult)}>${scan.gateResult}<//></td>
                     <td>${scan.criticalCount === null ? "-" : scan.criticalCount}</td>
                     <td>${scan.highCount === null ? "-" : scan.highCount}</td>
-                    <td className="mono">${scan.shortSha}</td>
+                    <td className="mono">${scan.shortSha || "-"}</td>
                     <td>${scan.trivyVersion || "-"}</td>
+                    <td className="mono">${shortDigest(scan.scannedImageDigest)}</td>
+                    <td>
+                      <${Badge} kind=${scanImageMatch(scan, environments) === "MATCH" ? "good" : scanImageMatch(scan, environments) === "MISMATCH" ? "bad" : "warn"}>
+                        ${scanImageMatch(scan, environments)}
+                      <//>
+                    </td>
                     <td className="mono">${shortDigest(scan.sbomSha256)}</td>
                     <td>${formatTime(scan.time)}</td>
                   </tr>`)}
@@ -871,7 +885,12 @@ function App() {
             wide=${true}
           >
             ${security.data
-              ? html`<${SecurityBody} data=${security.data} />`
+              ? html`
+                <${SecurityBody}
+                  data=${security.data}
+                  environments=${environments.data}
+                />
+              `
               : null}
           <//>
 
