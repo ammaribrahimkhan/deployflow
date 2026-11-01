@@ -1,3 +1,4 @@
+
 locals {
   tags = {
     project     = var.project
@@ -12,8 +13,8 @@ resource "azurerm_resource_group" "this" {
   tags     = local.tags
 }
 
-# The registry, the Container Apps environment, the platform log workspace and the
-# action group are created by the "shared" stack, which must be applied first.
+# The registry, Container Apps environment, platform log workspace
+# and action group are created by the shared stack.
 data "azurerm_container_registry" "shared" {
   name                = var.acr_name
   resource_group_name = var.shared_resource_group_name
@@ -59,6 +60,10 @@ module "container_app" {
   acr_login_server             = data.azurerm_container_registry.shared.login_server
   image_name                   = var.image_name
   image_tag                    = var.image_tag
+
+  # Keep at least one staging replica running to prevent scale-to-zero.
+  min_replicas = 1
+  max_replicas = 2
 }
 
 module "alerts" {

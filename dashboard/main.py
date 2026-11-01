@@ -1,4 +1,3 @@
-
 """DeployFlow dashboard: a small Flask service that reads real data from Azure and Azure DevOps.
 
 Security design:
@@ -41,7 +40,10 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-LOCAL_TOKENS = {"viewer": secrets.token_urlsafe(24), "admin": secrets.token_urlsafe(24)}
+LOCAL_TOKENS = {
+    "viewer": secrets.token_urlsafe(24),
+    "admin": secrets.token_urlsafe(24),
+}
 
 OPEN_PATHS = {"/healthz", "/login"}
 RATE_LIMIT = 3
@@ -59,6 +61,7 @@ def log_event(**fields):
 
 def cached(key, loader):
     now = time.time()
+
     with _cache_lock:
         item = _cache.get(key)
         if item and item[0] > now:
@@ -76,7 +79,10 @@ def cached(key, loader):
 
 def current_user():
     if config.AUTH_MODE == "easyauth":
-        name = (request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME") or "").strip()
+        name = (
+            request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME") or ""
+        ).strip()
+
         if not name:
             return None
 
@@ -89,7 +95,10 @@ def current_user():
         return None
 
     for role, token in LOCAL_TOKENS.items():
-        if hmac.compare_digest(cookie.encode("utf-8"), token.encode("utf-8")):
+        if hmac.compare_digest(
+            cookie.encode("utf-8"),
+            token.encode("utf-8"),
+        ):
             return {"name": "local " + role, "role": role}
 
     return None
@@ -135,7 +144,10 @@ def security_headers(response):
         response.headers["Cache-Control"] = "no-store"
 
     if request.path.startswith("/api/"):
-        elapsed = time.perf_counter() - getattr(g, "started", time.perf_counter())
+        elapsed = time.perf_counter() - getattr(
+            g, "started", time.perf_counter()
+        )
+
         log_event(
             event="request",
             method=request.method,
@@ -169,7 +181,7 @@ def api_errors(handler):
 
 @app.errorhandler(Exception)
 def unexpected_error(error):
-    """Anything we did not expect becomes a readable message, and the terminal shows the details."""
+    """Anything unexpected becomes a readable message; the terminal shows the details."""
     if isinstance(error, HTTPException):
         return error
 
@@ -182,10 +194,17 @@ def unexpected_error(error):
 
     if request.path.startswith("/api/"):
         return jsonify(
-            error="The dashboard hit an unexpected problem (" + type(error).__name__ + "). Look at the terminal where it runs for details."
+            error=(
+                "The dashboard hit an unexpected problem ("
+                + type(error).__name__
+                + "). Look at the terminal where it runs for details."
+            )
         ), 500
 
-    return make_response("The dashboard hit an unexpected problem. Look at the terminal where it runs.", 500)
+    return make_response(
+        "The dashboard hit an unexpected problem. Look at the terminal where it runs.",
+        500,
+    )
 
 
 # ---------------------------------------------------------------- pages
@@ -203,7 +222,10 @@ def login():
         if (
             config.AUTH_MODE == "local"
             and token
-            and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+            and hmac.compare_digest(
+                token.encode("utf-8"),
+                expected.encode("utf-8"),
+            )
         ):
             response = redirect("/")
             response.set_cookie(
@@ -251,7 +273,6 @@ def _portal_link(resource_id, blade):
 
 def build_environment(key):
     cfg = config.ENVIRONMENTS[key]
-
     sub = azure_api.subscription_id()
 
     app_id = (
@@ -279,7 +300,9 @@ def build_environment(key):
             "app": _portal_link(app_id, "/overview"),
             "metrics": _portal_link(app_id, "/metrics"),
             "logs": _portal_link(app_id, "/logs"),
-            "applicationInsights": _portal_link(insights_id, "/overview"),
+            "applicationInsights": _portal_link(
+                insights_id, "/overview"
+            ),
             "workspace": _portal_link(workspace_id, "/logs"),
         },
     }
@@ -329,8 +352,7 @@ def build_environment(key):
         data["errors"].append("Container App: " + error.message)
 
     # Fetch revision-specific image information.
-    # IMPORTANT: The image shown on the dashboard must belong to the revision
-    # actually receiving traffic, not simply the newest candidate revision.
+    # The image shown must belong to the revision actually receiving traffic.
     try:
         revisions = azure_api.container_app_revisions(key)
 
@@ -359,13 +381,12 @@ def build_environment(key):
             revision_images[item.get("name")] = revision_image
 
         weighted_traffic = [
-            item for item in traffic
+            item
+            for item in traffic
             if (item.get("weight") or 0) > 0
         ]
 
-        # Resolve "latest" traffic to the app's latest revision.
         latest_revision = data.get("latestRevision")
-
         serving_images = set()
 
         for item in weighted_traffic:
@@ -401,8 +422,6 @@ def build_environment(key):
             )
 
         elif not weighted_traffic:
-            # No revision is receiving traffic. Do not claim that the
-            # newest candidate image is currently serving users.
             data.update(
                 {
                     "image": None,
@@ -414,10 +433,18 @@ def build_environment(key):
         data["revisions"] = [
             {
                 "name": item.get("name"),
-                "createdAt": (item.get("properties") or {}).get("createdTime"),
-                "active": (item.get("properties") or {}).get("active"),
-                "trafficWeight": (item.get("properties") or {}).get("trafficWeight"),
-                "health": (item.get("properties") or {}).get("healthState"),
+                "createdAt": (
+                    item.get("properties") or {}
+                ).get("createdTime"),
+                "active": (
+                    item.get("properties") or {}
+                ).get("active"),
+                "trafficWeight": (
+                    item.get("properties") or {}
+                ).get("trafficWeight"),
+                "health": (
+                    item.get("properties") or {}
+                ).get("healthState"),
             }
             for item in revisions[:6]
         ]
@@ -459,17 +486,17 @@ def build_environment(key):
 @api_errors
 def environments():
     def load():
-        # Warm up shared Azure authentication before parallel requests.
         azure_api.subscription_id()
         azure_api.get_token(azure_api.RESOURCE_ARM)
 
         keys = list(config.ENVIRONMENTS.keys())
 
-        # Load environments concurrently while preserving their display order.
         with ThreadPoolExecutor(
             max_workers=min(4, max(1, len(keys)))
         ) as executor:
-            results = list(executor.map(build_environment, keys))
+            results = list(
+                executor.map(build_environment, keys)
+            )
 
         return {"environments": results}
 
@@ -490,7 +517,8 @@ def pipelines():
         }
 
         missing = [
-            name for name, identifier in wanted.items()
+            name
+            for name, identifier in wanted.items()
             if identifier is None
         ]
 
@@ -556,17 +584,27 @@ def load_deployment_events():
                     cfg["workspace"],
                 )
 
-                for row in azure_api.log_query(customer_id, DEPLOYMENT_KQL):
+                for row in azure_api.log_query(
+                    customer_id,
+                    DEPLOYMENT_KQL,
+                ):
                     normalized_row = dict(row)
-                    normalized_row["time"] = normalized_row.get("TimeGenerated")
+                    normalized_row["time"] = normalized_row.get(
+                        "TimeGenerated"
+                    )
                     normalized_row["name"] = normalized_row.get("Name")
 
                     events.append(
-                        analysis.normalize_event(normalized_row, key)
+                        analysis.normalize_event(
+                            normalized_row,
+                            key,
+                        )
                     )
 
             except azure_api.ApiError as error:
-                problems.append(f"{cfg['label']}: {error.message}")
+                problems.append(
+                    f"{cfg['label']}: {error.message}"
+                )
 
         events.sort(
             key=lambda item: item.get("time") or "",
@@ -594,14 +632,21 @@ def deployments():
     for key in config.ENVIRONMENTS:
         stats[key] = analysis.deployment_stats(
             [
-                item for item in events
+                item
+                for item in events
                 if item["env"] == key
             ]
         )
 
+    # Show genuine failures and deployment attempts that were automatically
+    # rolled back. Do not list successful manual rollback operations as failures.
     failures = [
-        item for item in events
-        if item["kind"] in ("failure", "rollback")
+        item
+        for item in events
+        if (
+            item["kind"] == "failure"
+            or item.get("autoRolledBack")
+        )
     ][:20]
 
     return jsonify(
@@ -625,7 +670,8 @@ def blocked_releases():
         builds = azure_api.recent_builds([ci_id], 40)
 
         failed = [
-            item for item in builds
+            item
+            for item in builds
             if item.get("result") == "failed"
         ][:8]
 
@@ -659,7 +705,6 @@ def blocked_releases():
 @api_errors
 def security():
     events = load_deployment_events()["events"]
-
     latest = {}
 
     for event in events:
@@ -740,7 +785,9 @@ def slo():
                 entry["requestSlo"] = rows[0] if rows else None
 
             except azure_api.ApiError as error:
-                entry["errors"].append("Request logs: " + error.message)
+                entry["errors"].append(
+                    "Request logs: " + error.message
+                )
 
             try:
                 insights_id = azure_api.workspace_customer_id(
@@ -760,11 +807,16 @@ def slo():
                     entry["availability"] = {
                         "total": total,
                         "passed": passed,
-                        "percent": round(100.0 * passed / total, 3),
+                        "percent": round(
+                            100.0 * passed / total,
+                            3,
+                        ),
                     }
 
             except azure_api.ApiError as error:
-                entry["errors"].append("Availability test: " + error.message)
+                entry["errors"].append(
+                    "Availability test: " + error.message
+                )
 
             items.append(entry)
 
@@ -816,9 +868,7 @@ def alerts():
                 }
             )
 
-        return {
-            "alerts": result[:25]
-        }
+        return {"alerts": result[:25]}
 
     return jsonify(cached("alerts", load))
 
@@ -843,7 +893,10 @@ def action_guard():
 
     origin = request.headers.get("Origin")
 
-    if origin and urllib.parse.urlsplit(origin).netloc != request.host:
+    if (
+        origin
+        and urllib.parse.urlsplit(origin).netloc != request.host
+    ):
         return jsonify(
             error="Cross-site requests are not allowed."
         ), 403
@@ -851,7 +904,8 @@ def action_guard():
     now = time.time()
 
     recent = [
-        stamp for stamp in _rate_limit.get(user["name"], [])
+        stamp
+        for stamp in _rate_limit.get(user["name"], [])
         if now - stamp < RATE_WINDOW_SECONDS
     ]
 
@@ -976,8 +1030,15 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
 
     if config.AUTH_MODE == "local":
-        admin_link = "http://127.0.0.1:%d/login?token=%s" % (port, LOCAL_TOKENS["admin"])
-        viewer_link = "http://127.0.0.1:%d/login?token=%s" % (port, LOCAL_TOKENS["viewer"])
+        admin_link = (
+            "http://127.0.0.1:%d/login?token=%s"
+            % (port, LOCAL_TOKENS["admin"])
+        )
+
+        viewer_link = (
+            "http://127.0.0.1:%d/login?token=%s"
+            % (port, LOCAL_TOKENS["viewer"])
+        )
 
         print("")
         print("DeployFlow dashboard (local mode)")
@@ -990,7 +1051,18 @@ if __name__ == "__main__":
         print("  Stop the dashboard with Ctrl+C.")
         print("")
 
-        if os.environ.get("DASHBOARD_OPEN_BROWSER", "true").lower() == "true":
-            threading.Timer(2.0, webbrowser.open, args=[admin_link]).start()
+        if os.environ.get(
+            "DASHBOARD_OPEN_BROWSER", "true"
+        ).lower() == "true":
+            threading.Timer(
+                2.0,
+                webbrowser.open,
+                args=[admin_link],
+            ).start()
 
-    app.run(host="127.0.0.1", port=port, threaded=True, use_reloader=False)
+    app.run(
+        host="127.0.0.1",
+        port=port,
+        threaded=True,
+        use_reloader=False,
+    )
