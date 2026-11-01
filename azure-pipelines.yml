@@ -20,10 +20,10 @@ trigger:
       - main
   paths:
     include:
-      - app/*
+      - app/**
       - azure-pipelines.yml
-      - pipelines/*
-      - scripts/*
+      - pipelines/**
+      - scripts/**
       - .trivyignore
 
 pr:
@@ -32,10 +32,10 @@ pr:
       - main
   paths:
     include:
-      - app/*
+      - app/**
       - azure-pipelines.yml
-      - pipelines/*
-      - scripts/*
+      - pipelines/**
+      - scripts/**
       - .trivyignore
 
 pool:
@@ -237,23 +237,30 @@ stages:
             Write-Host "Building Docker image: $tag"
 
             # Pre-pull the base image with retries.
-            # If Docker Hub is unreachable but the image is already on this laptop,
-            # fall back to the legacy builder, which uses the local copy without contacting Docker Hub.
+            # If Docker Hub is unreachable, use a local copy if available.
+
             $baseImage = "python:3.12-slim"
             $pulled = $false
 
             for ($attempt = 1; $attempt -le 4; $attempt++) {
               docker pull $baseImage
-              if ($LASTEXITCODE -eq 0) { $pulled = $true; break }
+
+              if ($LASTEXITCODE -eq 0) {
+                $pulled = $true
+                break
+              }
+
               Write-Host "docker pull attempt $attempt failed. Retrying in $($attempt * 10) seconds..."
               Start-Sleep -Seconds ($attempt * 10)
             }
 
             if (-not $pulled) {
               docker image inspect $baseImage | Out-Null
+
               if ($LASTEXITCODE -ne 0) {
                 Fail "Cannot reach Docker Hub and $baseImage is not available locally."
               }
+
               Write-Host "##vso[task.logissue type=warning]Docker Hub unreachable. Building from the local copy of $baseImage."
               $env:DOCKER_BUILDKIT = "0"
             }
@@ -475,6 +482,7 @@ stages:
             $scannedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
             # 6. Generate security summary.
+            # The immutable image digest is added after the ACR push.
 
             $summary = [ordered]@{
               tool              = "trivy"
@@ -569,23 +577,24 @@ stages:
 
               # Read security evidence.
 
-   $security = Get-Content `
-  (Join-Path $reports "security-summary.json") `
-  -Raw | ConvertFrom-Json
+              $security = Get-Content `
+                (Join-Path $reports "security-summary.json") `
+                -Raw | ConvertFrom-Json
 
-# Bind the Trivy scan evidence to the immutable image pushed to ACR.
-$security | Add-Member `
-  -NotePropertyName scannedImageDigest `
-  -NotePropertyValue $digest `
-  -Force
+              # Bind the Trivy scan evidence to the immutable image pushed to ACR.
 
-$security | Add-Member `
-  -NotePropertyName scannedImageReference `
-  -NotePropertyValue ("{0}@{1}" -f $image, $digest) `
-  -Force
+              $security | Add-Member `
+                -NotePropertyName scannedImageDigest `
+                -NotePropertyValue $digest `
+                -Force
 
-Write-Host "Scanned image digest: $($security.scannedImageDigest)"
-Write-Host "Scanned image reference: $($security.scannedImageReference)"
+              $security | Add-Member `
+                -NotePropertyName scannedImageReference `
+                -NotePropertyValue ("{0}@{1}" -f $image, $digest) `
+                -Force
+
+              Write-Host "Scanned image digest: $($security.scannedImageDigest)"
+              Write-Host "Scanned image reference: $($security.scannedImageReference)"
 
               # Create release metadata.
 
