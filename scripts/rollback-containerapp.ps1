@@ -41,7 +41,8 @@ function Write-Record($record) {
 }
 
 # 1. What exists?
-$revText = (az containerapp revision list --name $AppName --resource-group $ResourceGroup --query "[].{name:name, active:properties.active, created:properties.createdTime, traffic:properties.trafficWeight, image:properties.template.containers[0].image}" -o json | Out-String)
+$revText = (az containerapp revision list --name $AppName --resource-group $ResourceGroup --all --query "[].{name:name, active:properties.active, created:properties.createdTime, traffic:properties.trafficWeight, image:properties.template.containers[0].image}" -o json | Out-String)
+
 if ($LASTEXITCODE -ne 0) { Fail "Could not list the revisions of $AppName" }
 $revisions = @(Flatten (ConvertFrom-Json $revText))
 if ($revisions.Count -eq 0) { Fail "No revisions found for $AppName" }
