@@ -1,3 +1,4 @@
+
 # DeployFlow rollback pipeline (Milestone 7)
 #
 # Manual only. Sends 100% of the production traffic back to an earlier revision.
@@ -5,9 +6,9 @@
 # as a release. Safe to run more than once (idempotent). Every rollback is also recorded as an
 # event in Application Insights (best effort).
 #
-# Parameters (shown in the "Run pipeline" form):
+# Parameters:
 #   targetRevision : leave empty to go back to the previous revision
-#   reason         : short text stored in the rollback record (no quote characters please)
+#   reason         : short text stored in the rollback record
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
@@ -69,8 +70,7 @@ stages:
                     workingDirectory: $(Build.SourcesDirectory)
 
                 - powershell: |
-                    # Fetching the dynamically exposed App URL from preceding deployment context if applicable
-                    # If $(appUrl) isn't loaded globally, ensure it is set as a pipeline/environment variable.
+                    # Smoke test production after the rollback.
                     & "$(Build.SourcesDirectory)\scripts\smoke-test.ps1" -BaseUrl "$(appUrl)" -ExpectedSha "" -ExpectedEnvironment "prod" -MaxP95Ms 5000 -OutputPath "$(Build.ArtifactStagingDirectory)\rollback\smoke-after-rollback.json"
                     if ($LASTEXITCODE -ne 0) { exit 1 }
                   workingDirectory: $(Build.SourcesDirectory)
@@ -80,6 +80,7 @@ stages:
                   displayName: Record the rollback event in Application Insights
                   condition: always()
                   continueOnError: true
+                  retryCountOnTaskFailure: 3
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: ps
