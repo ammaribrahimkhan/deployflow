@@ -36,6 +36,7 @@ function percent(value) {
   return value === null || value === undefined ? "-" : value + "%";
 }
 
+// Colours: good = green, warn = amber, bad = red, muted = grey.
 function kindOf(text) {
   const value = String(text || "").toLowerCase();
 
@@ -81,7 +82,7 @@ function deploymentOutcome(event) {
 
   if (name === "rollback") {
     if (outcome === "rolled_back") {
-      return { label: "Recovered", kind: "good" };
+      return { label: "Recovered (manual rollback)", kind: "good" };
     }
 
     if (outcome === "noop_already_live" || outcome === "already_live") {
@@ -89,12 +90,12 @@ function deploymentOutcome(event) {
     }
 
     if (outcome === "rollback_failed" || outcome === "failed") {
-      return { label: "Failed", kind: "bad" };
+      return { label: "Rollback failed", kind: "bad" };
     }
   }
 
   if (name === "deployment" && outcome === "rolled_back") {
-    return { label: "Recovered", kind: "warn" };
+    return { label: "Rejected, recovered automatically", kind: "warn" };
   }
 
   if (outcome === "promoted" || outcome === "deployed") {
@@ -438,32 +439,75 @@ function DeploymentsTable({ events }) {
 
 // ---------------------------------------------------------------- security, SLO, alerts
 
-function scanImageMatch(scan, environments) {
-  const items = environments && environments.environments
-    ? environments.environments
-    : [];
+function SecurityBody({ data }) {
+  const deployedImages = data.deployedImages || [];
+  const scanHistory = data.scanHistory || [];
+  const blockedReleases = data.blockedReleases || [];
 
-  const live = items.find((item) => item.key === scan.env);
-
-  const scannedDigest = (scan.scannedImageDigest || "").toLowerCase();
-  const liveDigest = (
-    live && live.imageDigest ? live.imageDigest : ""
-  ).toLowerCase();
-
-  if (!scannedDigest || !liveDigest) {
-    return "UNVERIFIED";
-  }
-
-  return scannedDigest === liveDigest ? "MATCH" : "MISMATCH";
-}
-
-function SecurityBody({ data, environments }) {
   return html`
     <div>
-      <h3 className="muted">Latest scan of the deployed image</h3>
+      <h3 className="muted">Is the image that is running now the image that was scanned?</h3>
 
-      ${data.latestScans.length === 0
-        ? html`<p className="muted">No scan results yet. Run a deployment after Milestone 8 to record one.</p>`
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Environment</th>
+              <th>Result</th>
+              <th>Live image digest</th>
+              <th>Scan gate</th>
+              <th>Critical</th>
+              <th>High</th>
+              <th>Commit</th>
+              <th>Scanner</th>
+              <th>SBOM hash</th>
+              <th>Scanned</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${deployedImages.map((item) => {
+              const scan = item.deployedImageScan;
+              const verified = item.verification === "MATCH";
+
+              return html`
+                <tr key=${item.env}>
+                  <td>${item.label}</td>
+                  <td>
+                    <${Badge} kind=${verified ? "good" : "warn"}>
+                      ${verified ? "Verified" : "No scan evidence for this image"}
+                    <//>
+                    ${verified && item.matchedBy
+                      ? html`<div className="muted">matched by ${item.matchedBy}</div>`
+                      : null}
+                  </td>
+                  <td className="mono">${shortDigest(item.liveImageDigest)}</td>
+                  <td>
+                    ${scan
+                      ? html`<${Badge} kind=${kindOf(scan.gateResult)}>${scan.gateResult}<//>`
+                      : "-"}
+                  </td>
+                  <td>${scan && scan.criticalCount !== null ? scan.criticalCount : "-"}</td>
+                  <td>${scan && scan.highCount !== null ? scan.highCount : "-"}</td>
+                  <td className="mono">${scan ? scan.shortSha || "-" : "-"}</td>
+                  <td>${scan ? scan.trivyVersion || "-" : "-"}</td>
+                  <td className="mono">${scan ? shortDigest(scan.sbomSha256) : "-"}</td>
+                  <td>${scan ? formatTime(scan.time) : "-"}</td>
+                </tr>`;
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="muted">
+        Verified means a recorded security scan belongs to the exact image digest that is receiving
+        traffic right now. "No scan evidence" means the image was released before scan results were
+        recorded, or no record could be matched. It does not mean the scan failed: read the Scan gate column.
+      </p>
+
+      <h3 className="muted">Security scan history</h3>
+
+      ${scanHistory.length === 0
+        ? html`<p className="muted">No security scan records found.</p>`
         : html`
           <div className="table-wrap">
             <table>
@@ -475,27 +519,21 @@ function SecurityBody({ data, environments }) {
                   <th>High</th>
                   <th>Commit</th>
                   <th>Scanner</th>
-                  <th>Scanned image</th>
-                  <th>Live image match</th>
+                  <th>Image digest</th>
                   <th>SBOM hash</th>
                   <th>Scanned</th>
                 </tr>
               </thead>
               <tbody>
-                ${data.latestScans.map((scan) => html`
-                  <tr key=${scan.env}>
+                ${scanHistory.map((scan, index) => html`
+                  <tr key=${scan.env + scan.time + index}>
                     <td>${scan.label}</td>
                     <td><${Badge} kind=${kindOf(scan.gateResult)}>${scan.gateResult}<//></td>
                     <td>${scan.criticalCount === null ? "-" : scan.criticalCount}</td>
                     <td>${scan.highCount === null ? "-" : scan.highCount}</td>
                     <td className="mono">${scan.shortSha || "-"}</td>
                     <td>${scan.trivyVersion || "-"}</td>
-                    <td className="mono">${shortDigest(scan.scannedImageDigest)}</td>
-                    <td>
-                      <${Badge} kind=${scanImageMatch(scan, environments) === "MATCH" ? "good" : scanImageMatch(scan, environments) === "MISMATCH" ? "bad" : "warn"}>
-                        ${scanImageMatch(scan, environments)}
-                      <//>
-                    </td>
+                    <td className="mono">${shortDigest(scan.scannedImageDigest || scan.deployedImageDigest)}</td>
                     <td className="mono">${shortDigest(scan.sbomSha256)}</td>
                     <td>${formatTime(scan.time)}</td>
                   </tr>`)}
@@ -505,7 +543,7 @@ function SecurityBody({ data, environments }) {
 
       <h3 className="muted">Failed CI runs (releases that never reached deployment)</h3>
 
-      ${data.blockedReleases.length === 0
+      ${blockedReleases.length === 0
         ? html`<p className="muted">None in the recent history.</p>`
         : html`
           <div className="table-wrap">
@@ -521,7 +559,7 @@ function SecurityBody({ data, environments }) {
                 </tr>
               </thead>
               <tbody>
-                ${data.blockedReleases.map((run) => html`
+                ${blockedReleases.map((run) => html`
                   <tr key=${run.id}>
                     <td>${formatTime(run.finishedAt)}</td>
                     <td>${run.number}</td>
@@ -576,33 +614,51 @@ function AlertsBody({ data }) {
     return html`<p className="muted">No DeployFlow alerts in the last 7 days.</p>`;
   }
 
+  // Active alerts first, then the history.
+  const ordered = data.alerts.slice().sort((a, b) => {
+    const rank = (alert) => (alert.condition === "Fired" ? 0 : 1);
+    return rank(a) - rank(b);
+  });
+
+  const active = ordered.filter((alert) => alert.condition === "Fired").length;
+
   return html`
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Rule</th>
-            <th>Severity</th>
-            <th>Condition</th>
-            <th>Alert state</th>
-            <th>Target</th>
-            <th>Fired</th>
-            <th>Changed</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${data.alerts.map((alert, index) => html`
-            <tr key=${alert.rule + index}>
-              <td>${alert.rule}</td>
-              <td>${alert.severity}</td>
-              <td><${Badge} kind=${kindOf(alert.condition)}>${alert.condition}<//></td>
-              <td>${alert.state}</td>
-              <td>${alert.target}</td>
-              <td>${formatTime(alert.firedAt)}</td>
-              <td>${formatTime(alert.changedAt)}</td>
-            </tr>`)}
-        </tbody>
-      </table>
+    <div>
+      <p className=${active ? "error" : "muted"}>
+        ${active
+          ? active + " alert(s) are firing right now. They clear by themselves when the problem is gone."
+          : "No alert is firing right now. The resolved alerts below are history."}
+      </p>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Rule</th>
+              <th>Severity</th>
+              <th>Status</th>
+              <th>Target</th>
+              <th>Fired</th>
+              <th>Cleared</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${ordered.map((alert, index) => html`
+              <tr key=${alert.rule + index}>
+                <td>${alert.rule}</td>
+                <td>${alert.severity}</td>
+                <td>
+                  <${Badge} kind=${alert.condition === "Fired" ? "bad" : alert.condition === "Resolved" ? "good" : "muted"}>
+                    ${alert.condition === "Fired" ? "Active (firing now)" : alert.condition === "Resolved" ? "Resolved" : "Unknown"}
+                  <//>
+                </td>
+                <td>${alert.target}</td>
+                <td>${formatTime(alert.firedAt)}</td>
+                <td>${alert.condition === "Resolved" ? formatTime(alert.changedAt) : "-"}</td>
+              </tr>`)}
+          </tbody>
+        </table>
+      </div>
     </div>`;
 }
 
@@ -885,12 +941,7 @@ function App() {
             wide=${true}
           >
             ${security.data
-              ? html`
-                <${SecurityBody}
-                  data=${security.data}
-                  environments=${environments.data}
-                />
-              `
+              ? html`<${SecurityBody} data=${security.data} />`
               : null}
           <//>
 

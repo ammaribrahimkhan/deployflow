@@ -1,0 +1,14 @@
+ContainerAppSystemLogs_CL
+| where TimeGenerated > ago(__HOURS__h)
+| where ContainerAppName_s == '__APP_NAME__'
+| where Type_s == 'Warning'
+    or Reason_s in ('ProbeFailed', 'ContainerBackOff', 'ImagePullBackOff', 'ErrImagePull', 'ReplicaUnhealthy')
+    or Log_s has_any ('probe failed', 'back-off', 'failed to pull image')
+| project
+    TimeGenerated,
+    RevisionName_s,
+    Reason_s,
+    Type_s,
+    Log_s
+| order by TimeGenerated desc
+| take 100

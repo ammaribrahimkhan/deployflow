@@ -1,3 +1,4 @@
+
 # Identity the app uses to pull images. No passwords anywhere.
 resource "azurerm_user_assigned_identity" "app" {
   name                = "id-${var.project}-${var.environment}-${var.location_short}"
@@ -26,7 +27,7 @@ resource "azurerm_container_app" "this" {
   resource_group_name          = var.resource_group_name
   container_app_environment_id = var.container_app_environment_id
 
-  # "Multiple" lets two revisions run side by side (needed for traffic splitting).
+  # Multiple revisions allow controlled deployments and traffic splitting.
   revision_mode = "Multiple"
   tags          = var.tags
 
@@ -66,31 +67,42 @@ resource "azurerm_container_app" "this" {
         value = var.environment
       }
 
+      # Allows the application time to initialize before other probes run.
+      startup_probe {
+        transport               = "HTTP"
+        port                    = var.container_port
+        path                    = "/health"
+        interval_seconds        = 10
+        timeout                 = 5
+        failure_count_threshold = 30
+      }
+
+      # Controls whether the replica is ready to receive traffic.
+      readiness_probe {
+        transport               = "HTTP"
+        port                    = var.container_port
+        path                    = "/health"
+        interval_seconds        = 10
+        timeout                 = 5
+        failure_count_threshold = 3
+        success_count_threshold = 1
+      }
+
+      # Restarts the container if it becomes unhealthy.
       liveness_probe {
         transport               = "HTTP"
         port                    = var.container_port
         path                    = "/health"
         initial_delay           = 10
         interval_seconds        = 30
-        timeout                 = 3
+        timeout                 = 5
         failure_count_threshold = 3
-      }
-
-      readiness_probe {
-        transport               = "HTTP"
-        port                    = var.container_port
-        path                    = "/health"
-        interval_seconds        = 10
-        timeout                 = 3
-        failure_count_threshold = 3
-        success_count_threshold = 1
       }
     }
   }
 
-  # Terraform creates the app. The release pipelines own everything that changes
-  # at release time: the image, release-time environment variables and the traffic
-  # split between revisions. Terraform must not undo those.
+  # Release pipelines own image changes, release-time environment variables
+  # and traffic splits. Terraform must not undo those changes.
   lifecycle {
     ignore_changes = [
       template[0].container[0].image,

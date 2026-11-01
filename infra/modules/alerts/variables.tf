@@ -104,7 +104,13 @@ variable "error_rate_min_requests" {
 }
 
 variable "unhealthy_events_threshold" {
-  description = "Number of probe or image-pull problem events in 10 minutes that triggers the alert."
+  description = "Number of crash back-off or image pull problem events in 10 minutes that triggers the unhealthy-revision alert."
   type        = number
   default     = 3
+}
+
+variable "probe_failure_threshold" {
+  description = "Number of failed health probes in 10 minutes that triggers the unhealthy-revision alert. A few failures are normal while a revision starts or stops, so this is higher."
+  type        = number
+  default     = 12
 }

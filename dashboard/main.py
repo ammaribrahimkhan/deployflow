@@ -1,4 +1,3 @@
-
 """DeployFlow dashboard: a small Flask service that reads real data from Azure and Azure DevOps.
 
 Security design:
@@ -483,9 +482,7 @@ def build_environment(key):
     return data
 
 
-@app.get("/api/environments")
-@api_errors
-def environments():
+def load_environments():
     def load():
         azure_api.subscription_id()
         azure_api.get_token(azure_api.RESOURCE_ARM)
@@ -501,7 +498,13 @@ def environments():
 
         return {"environments": results}
 
-    return jsonify(cached("environments", load))
+    return cached("environments", load)
+
+
+@app.get("/api/environments")
+@api_errors
+def environments():
+    return jsonify(load_environments())
 
 
 # ---------------------------------------------------------------- pipelines
@@ -643,7 +646,7 @@ def deployments():
         )
 
     # Show genuine failures and deployment attempts that were automatically
-    # rolled back. Do not list successful manual rollback operations as failures.
+    # rolled back. Successful manual rollbacks are not failures.
     failures = [
         item
         for item in events
@@ -705,36 +708,119 @@ def blocked_releases():
     return cached("blocked-releases", load)
 
 
+def normalize_digest(value):
+    """Lower-case a digest and drop the 'sha256:' prefix.
+
+    Digests then compare equal however they were written.
+    """
+    if not isinstance(value, str):
+        return ""
+
+    text = value.strip().lower()
+
+    if text.startswith("sha256:"):
+        text = text[len("sha256:"):]
+
+    return text
+
+
+def security_scan_record(event, env_key):
+    """Return the security evidence recorded for one deployment event."""
+    return {
+        "env": env_key,
+        "label": config.ENVIRONMENTS[env_key]["label"],
+        "time": event["time"],
+        "shortSha": event["shortSha"],
+        "gateResult": event["gateResult"],
+        "criticalCount": event["criticalCount"],
+        "highCount": event["highCount"],
+        "trivyVersion": event["trivyVersion"],
+        "sbomSha256": event["sbomSha256"],
+        "scannedImage": event["scannedImage"],
+        "scannedImageDigest": event["scannedImageDigest"],
+        "scannedImageReference": event["scannedImageReference"],
+        # The digest this release deployed. Older records have no scannedImageDigest,
+        # but they still say which digest was deployed after the scan gate passed.
+        "deployedImageDigest": event["imageDigest"],
+    }
+
+
+def find_scan_for_digest(records, live_digest):
+    """Find the newest scan record that belongs to exactly this image digest.
+
+    Records are newest first. Returns (record, how_it_matched) or (None, None).
+    A scan belongs to an image, so records of every environment are searched.
+    """
+    if not live_digest:
+        return None, None
+
+    for scan in records:
+        if normalize_digest(scan.get("scannedImageDigest")) == live_digest:
+            return scan, "scanned image digest"
+
+    for scan in records:
+        if normalize_digest(scan.get("deployedImageDigest")) == live_digest:
+            return scan, "deployed image digest (older record)"
+
+    return None, None
+
+
 @app.get("/api/security")
 @api_errors
 def security():
     events = load_deployment_events()["events"]
-    latest = {}
+    environment_data = load_environments()
 
-    for event in events:
-        if event["gateResult"] and event["env"] not in latest:
-            latest[event["env"]] = event
-
-    scans = [
-        {
-            "env": key,
-            "label": config.ENVIRONMENTS[key]["label"],
-            "time": event["time"],
-            "shortSha": event["shortSha"],
-            "gateResult": event["gateResult"],
-            "criticalCount": event["criticalCount"],
-            "highCount": event["highCount"],
-            "trivyVersion": event["trivyVersion"],
-            "sbomSha256": event["sbomSha256"],
-            "scannedImage": event["scannedImage"],
-            "scannedImageDigest": event["scannedImageDigest"],
-            "scannedImageReference": event["scannedImageReference"],
-        }
-        for key, event in latest.items()
+    all_records = [
+        security_scan_record(event, event["env"])
+        for event in events
+        if event["gateResult"]
     ]
 
+    all_records.sort(
+        key=lambda item: item.get("time") or "",
+        reverse=True,
+    )
+
+    deployed_images = []
+
+    for env in environment_data["environments"]:
+        key = env["key"]
+        live_digest = normalize_digest(env.get("imageDigest"))
+
+        env_records = [
+            record for record in all_records
+            if record["env"] == key
+        ]
+
+        latest_scan = env_records[0] if env_records else None
+
+        matching_scan, matched_by = find_scan_for_digest(
+            all_records,
+            live_digest,
+        )
+
+        deployed_images.append(
+            {
+                "env": key,
+                "label": env["label"],
+                "liveImage": env.get("image"),
+                "liveImageDigest": env.get("imageDigest"),
+                "verification": "MATCH" if matching_scan else "UNVERIFIED",
+                "matchedBy": matched_by,
+                "deployedImageScan": matching_scan,
+                "latestScan": latest_scan,
+            }
+        )
+
     return jsonify(
-        latestScans=scans,
+        deployedImages=deployed_images,
+        scanHistory=all_records[:100],
+        latestScans=[
+            item["latestScan"]
+            for item in deployed_images
+            if item["latestScan"] is not None
+        ],
         blockedReleases=blocked_releases(),
     )
 

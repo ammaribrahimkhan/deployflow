@@ -13,13 +13,16 @@ locals {
     | where total >= ${var.error_rate_min_requests} and errorPercent > ${var.error_rate_threshold_percent}
   QUERY
 
-  # Platform events that mean a revision is unhealthy.
+  # A revision is unhealthy when it keeps crashing or cannot pull its image (a few events are enough),
+  # or when its health probes keep failing (it takes many events: a few failed probes are normal
+  # while a revision starts or stops during a release or a rollback).
   unhealthy_query = <<-QUERY
     ContainerAppSystemLogs_CL
     | where ContainerAppName_s == '${var.container_app_name}'
-    | where Reason_s in ('ProbeFailed', 'ContainerBackOff', 'ImagePullBackOff', 'ErrImagePull') or Log_s has_any ('probe failed', 'back-off', 'failed to pull image')
-    | summarize events = count()
-    | where events >= ${var.unhealthy_events_threshold}
+    | extend isProbeFailure = Reason_s == 'ProbeFailed' or Log_s has 'probe failed'
+    | extend isCrashOrPull = Reason_s in ('ContainerBackOff', 'ImagePullBackOff', 'ErrImagePull') or Log_s has_any ('back-off', 'failed to pull image')
+    | summarize probeFailures = countif(isProbeFailure), crashOrPullProblems = countif(isCrashOrPull)
+    | where crashOrPullProblems >= ${var.unhealthy_events_threshold} or probeFailures >= ${var.probe_failure_threshold}
   QUERY
 }
 
@@ -142,7 +145,7 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "unhealthy_revision" {
   resource_group_name     = var.resource_group_name
   location                = var.location
   display_name            = "${var.environment}: unhealthy revision"
-  description             = "${var.environment}: repeated probe failures, back-offs or image pull problems."
+  description             = "${var.environment}: at least ${var.unhealthy_events_threshold} crash back-off or image pull problems, or at least ${var.probe_failure_threshold} failed health probes, in 10 minutes."
   evaluation_frequency    = "PT5M"
   window_duration         = "PT10M"
   scopes                  = [var.log_analytics_workspace_id]
