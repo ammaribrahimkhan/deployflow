@@ -231,7 +231,7 @@ function Panel({ title, state, wide, children }) {
       ${state.data
         ? children
         : state.loading
-          ? html`<p className="muted">Loading...</p>`
+          ? html`<p className="muted">Loading... (the first load can take up to a minute while the apps wake up)</p>`
           : null}
     </section>`;
 }
@@ -298,6 +298,12 @@ function EnvironmentCard({ env }) {
   const live = env.live || {};
   const traffic = env.traffic || [];
 
+  // The app was asked for its commit and version, but did not answer (for example a cold start).
+  const infoMissing = live.healthOk !== undefined && live.infoOk === false;
+  const unknown = "unknown (/api/info did not answer" + (live.infoError ? ": " + live.infoError : "") + ")";
+
+  const servingRevision = env.servingRevision || live.revision || env.latestRevision || "-";
+
   return html`
     <article className="card">
       <header>
@@ -309,11 +315,15 @@ function EnvironmentCard({ env }) {
         html`<p className="error" key=${message}>${message}</p>`
       )}
 
+      ${(env.notes || []).map((message) =>
+        html`<p className="muted" key=${message}>Note: ${message}</p>`
+      )}
+
       <dl>
-        <dt>Commit</dt><dd className="mono">${live.gitSha || "-"}</dd>
-        <dt>Version</dt><dd>${live.version || "-"}</dd>
-        <dt>Environment name</dt><dd>${live.environment || "-"}</dd>
-        <dt>Serving revision</dt><dd className="mono">${live.revision || env.latestRevision || "-"}</dd>
+        <dt>Commit</dt><dd className="mono">${live.gitSha || (infoMissing ? unknown : "-")}</dd>
+        <dt>Version</dt><dd>${live.version || (infoMissing ? unknown : "-")}</dd>
+        <dt>Environment name</dt><dd>${live.environment || (infoMissing ? unknown : "-")}</dd>
+        <dt>Serving revision</dt><dd className="mono">${servingRevision}</dd>
         <dt>Image</dt><dd className="mono">${env.imageTag ? "tag " + env.imageTag : env.imageDigest ? "digest " + shortDigest(env.imageDigest) : "-"}</dd>
         <dt>Health check</dt><dd>${live.healthOk === undefined ? "-" : live.healthOk ? "OK in " + live.healthMs + " ms" : "FAILED " + (live.error || "")}</dd>
         <dt>Last checked</dt><dd>${formatTime(live.checkedAt)}</dd>
@@ -479,6 +489,9 @@ function SecurityBody({ data }) {
                     ${verified && item.matchedBy
                       ? html`<div className="muted">matched by ${item.matchedBy}</div>`
                       : null}
+                    ${(item.errors || []).map((message) =>
+                      html`<div className="error" key=${message}>${message}</div>`
+                    )}
                   </td>
                   <td className="mono">${shortDigest(item.liveImageDigest)}</td>
                   <td>
@@ -854,7 +867,7 @@ function App() {
                 <h2>Environments</h2>
                 ${environments.error
                   ? html`<p className="error">${environments.error}</p>`
-                  : html`<p className="muted">Loading... (the first request can take a few seconds while the apps wake up)</p>`}
+                  : html`<p className="muted">Loading... (the first request can take up to a minute while the apps wake up)</p>`}
               </section>`}
         </div>
 

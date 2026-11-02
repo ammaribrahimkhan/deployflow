@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 import config
@@ -69,6 +72,18 @@ def make_event(env, deployed_digest, scanned_digest="", gate="passed", time="202
     }
 
 
+def fake_state(digest):
+    """What read_app_state returns: Azure Resource Manager facts only."""
+    return {
+        "errors": [],
+        "notes": [],
+        "image": "registry/app@" + digest,
+        "imageDigest": digest,
+        "traffic": [],
+        "revisions": [],
+    }
+
+
 def mock_security_sources(monkeypatch, events, staging_digest, production_digest):
     monkeypatch.setattr(
         main,
@@ -76,27 +91,12 @@ def mock_security_sources(monkeypatch, events, staging_digest, production_digest
         lambda: {"events": events, "problems": []},
     )
 
-    monkeypatch.setattr(
-        main,
-        "load_environments",
-        lambda: {
-            "environments": [
-                {
-                    "key": "staging",
-                    "label": "Staging",
-                    "image": "registry/app@" + staging_digest,
-                    "imageDigest": staging_digest,
-                },
-                {
-                    "key": "production",
-                    "label": "Production",
-                    "image": "registry/app@" + production_digest,
-                    "imageDigest": production_digest,
-                },
-            ]
-        },
-    )
+    states = {
+        "staging": fake_state(staging_digest),
+        "production": fake_state(production_digest),
+    }
 
+    monkeypatch.setattr(main, "read_app_state", lambda key: states[key])
     monkeypatch.setattr(main, "blocked_releases", lambda: [])
 
 
@@ -159,6 +159,106 @@ def test_unexpected_problems_come_back_as_readable_json(client, monkeypatch):
 
     assert response.status_code == 500
     assert "unexpected problem" in response.get_json()["error"].lower()
+
+
+def test_serving_revision_is_the_one_that_receives_traffic():
+    traffic = [{"revision": "app--b83-a1", "weight": 100}]
+
+    assert main.pick_serving_revision(traffic, "app--0000003") == "app--b83-a1"
+    assert main.pick_serving_revision([{"revision": "latest", "weight": 100}], "app--0000002") == "app--0000002"
+    assert main.pick_serving_revision(
+        [{"revision": "a", "weight": 10}, {"revision": "b", "weight": 90}],
+        "x",
+    ) == "b"
+    assert main.pick_serving_revision([], "x") is None
+
+
+def test_simultaneous_requests_share_one_calculation(client):
+    calls = []
+
+    def slow_loader():
+        calls.append(1)
+        time.sleep(0.2)
+        return {"value": 1}
+
+    results = []
+
+    def worker():
+        results.append(main.cached("shared-key", slow_loader))
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    assert len(calls) == 1
+    assert len(results) == 5
+
+
+def test_environment_shows_the_revision_that_serves_traffic(client, monkeypatch):
+    sign_in(client, "viewer")
+
+    monkeypatch.setattr(main.azure_api, "subscription_id", lambda: "sub")
+    monkeypatch.setattr(main.azure_api, "get_token", lambda resource: "token")
+
+    def fake_app(key):
+        return {
+            "properties": {
+                "provisioningState": "Succeeded",
+                "latestRevisionName": "ca--0000003",
+                "configuration": {
+                    "ingress": {
+                        "fqdn": "ca.example.azurecontainerapps.io",
+                        "traffic": [{"revisionName": "ca--b83-a1", "weight": 100}],
+                    }
+                },
+                "template": {"containers": [{"image": "reg/app@sha256:aaa"}]},
+            }
+        }
+
+    def fake_revisions(key):
+        return [
+            {
+                "name": "ca--b83-a1",
+                "properties": {
+                    "createdTime": "2026-11-01T16:00:00Z",
+                    "active": True,
+                    "trafficWeight": 100,
+                    "template": {"containers": [{"image": "reg/app@sha256:bbb"}]},
+                },
+            },
+            {
+                "name": "ca--0000003",
+                "properties": {
+                    "createdTime": "2026-11-02T01:00:00Z",
+                    "active": True,
+                    "trafficWeight": 0,
+                    "template": {"containers": [{"image": "reg/app@sha256:ccc"}]},
+                },
+            },
+        ]
+
+    def fake_probe(url, timeout=20):
+        if url.endswith("/health"):
+            return {"ok": True, "status": 200, "ms": 100, "json": {"status": "healthy"}, "error": None}
+
+        return {"ok": False, "status": 0, "ms": 30000, "json": None, "error": "timed out"}
+
+    monkeypatch.setattr(main.azure_api, "container_app", fake_app)
+    monkeypatch.setattr(main.azure_api, "container_app_revisions", fake_revisions)
+    monkeypatch.setattr(main.azure_api, "probe", fake_probe)
+
+    body = client.get("/api/environments").get_json()
+    production = [item for item in body["environments"] if item["key"] == "production"][0]
+
+    assert production["servingRevision"] == "ca--b83-a1"
+    assert production["imageDigest"] == "sha256:bbb"
+    assert production["live"]["infoOk"] is False
+    assert production["live"]["infoError"] == "timed out"
+    assert any("no traffic" in note for note in production["notes"])
 
 
 def test_security_matches_the_scanned_image_digest(client, monkeypatch):

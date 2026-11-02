@@ -52,6 +52,7 @@ _rate_limit = {}
 
 _cache = {}
 _cache_lock = threading.Lock()
+_key_locks = {}
 
 
 def log_event(**fields):
@@ -60,19 +61,31 @@ def log_event(**fields):
 
 
 def cached(key, loader):
+    """Reuse an answer for a few seconds.
+
+    Requests that arrive at the same moment for the same key share ONE calculation
+    instead of each repeating the same slow work.
+    """
     now = time.time()
 
     with _cache_lock:
         item = _cache.get(key)
         if item and item[0] > now:
             return item[1]
+        key_lock = _key_locks.setdefault(key, threading.Lock())
 
-    value = loader()
+    with key_lock:
+        with _cache_lock:
+            item = _cache.get(key)
+            if item and item[0] > time.time():
+                return item[1]
 
-    with _cache_lock:
-        _cache[key] = (now + config.CACHE_SECONDS, value)
+        value = loader()
 
-    return value
+        with _cache_lock:
+            _cache[key] = (time.time() + config.CACHE_SECONDS, value)
+
+        return value
 
 
 # ---------------------------------------------------------------- sign-in and security headers
@@ -271,6 +284,215 @@ def _portal_link(resource_id, blade):
     return "https://portal.azure.com/#resource" + resource_id + blade
 
 
+def pick_serving_revision(traffic, latest_revision):
+    """The revision that receives the most traffic.
+
+    In the traffic list, "latest" stands for the newest revision.
+    """
+    best_name = None
+    best_weight = 0
+
+    for item in traffic or []:
+        weight = item.get("weight") or 0
+        name = item.get("revision")
+
+        if name == "latest":
+            name = latest_revision
+
+        if name and weight > best_weight:
+            best_name = name
+            best_weight = weight
+
+    return best_name
+
+
+def read_app_state(key):
+    """Everything Azure Resource Manager says about one app. No call to the app itself."""
+
+    def load():
+        state = {
+            "errors": [],
+            "notes": [],
+            "image": None,
+            "imageTag": None,
+            "imageDigest": None,
+            "provisioningState": None,
+            "runningStatus": None,
+            "latestRevision": None,
+            "servingRevision": None,
+            "fqdn": None,
+            "url": None,
+            "traffic": [],
+            "revisions": [],
+        }
+
+        try:
+            details = azure_api.container_app(key)
+            properties = details.get("properties") or {}
+
+            ingress = (
+                (properties.get("configuration") or {}).get("ingress") or {}
+            )
+
+            containers = (
+                (properties.get("template") or {}).get("containers") or [{}]
+            )
+
+            image = containers[0].get("image", "")
+            parts = analysis.image_parts(image)
+            fqdn = ingress.get("fqdn")
+
+            state.update(
+                {
+                    "image": image,
+                    "imageTag": parts["tag"],
+                    "imageDigest": parts["digest"],
+                    "provisioningState": properties.get("provisioningState"),
+                    "runningStatus": properties.get("runningStatus"),
+                    "latestRevision": properties.get("latestRevisionName"),
+                    "fqdn": fqdn,
+                    "url": ("https://" + fqdn) if fqdn else None,
+                    "traffic": [
+                        {
+                            "revision": item.get("revisionName") or "latest",
+                            "weight": item.get("weight") or 0,
+                        }
+                        for item in (ingress.get("traffic") or [])
+                    ],
+                }
+            )
+
+        except azure_api.ApiError as error:
+            state["errors"].append("Container App: " + error.message)
+
+        # The image shown must belong to the revision that really receives traffic.
+        try:
+            revisions = azure_api.container_app_revisions(key)
+
+            revisions.sort(
+                key=lambda item: (
+                    item.get("properties") or {}
+                ).get("createdTime") or "",
+                reverse=True,
+            )
+
+            revision_images = {}
+
+            for item in revisions:
+                props = item.get("properties") or {}
+
+                revision_containers = (
+                    (props.get("template") or {}).get("containers") or []
+                )
+
+                revision_images[item.get("name")] = (
+                    revision_containers[0].get("image", "")
+                    if revision_containers
+                    else ""
+                )
+
+            weighted_traffic = [
+                item
+                for item in state["traffic"]
+                if (item.get("weight") or 0) > 0
+            ]
+
+            serving_images = set()
+
+            for item in weighted_traffic:
+                revision_name = item.get("revision")
+
+                if revision_name == "latest":
+                    revision_name = state["latestRevision"]
+
+                serving_image = revision_images.get(revision_name, "")
+
+                if serving_image:
+                    serving_images.add(serving_image)
+
+            if len(serving_images) == 1:
+                serving_image = next(iter(serving_images))
+                serving_parts = analysis.image_parts(serving_image)
+
+                state.update(
+                    {
+                        "image": serving_image,
+                        "imageTag": serving_parts["tag"],
+                        "imageDigest": serving_parts["digest"],
+                    }
+                )
+
+            elif len(serving_images) > 1:
+                state.update(
+                    {
+                        "image": "Multiple images currently receiving traffic",
+                        "imageTag": None,
+                        "imageDigest": None,
+                    }
+                )
+
+            elif not weighted_traffic:
+                state.update(
+                    {
+                        "image": None,
+                        "imageTag": None,
+                        "imageDigest": None,
+                    }
+                )
+
+            state["revisions"] = [
+                {
+                    "name": item.get("name"),
+                    "createdAt": (item.get("properties") or {}).get("createdTime"),
+                    "active": (item.get("properties") or {}).get("active"),
+                    "trafficWeight": (item.get("properties") or {}).get("trafficWeight"),
+                    "health": (item.get("properties") or {}).get("healthState"),
+                }
+                for item in revisions[:6]
+            ]
+
+        except azure_api.ApiError as error:
+            state["errors"].append("Revisions: " + error.message)
+
+        serving = pick_serving_revision(state["traffic"], state["latestRevision"])
+        state["servingRevision"] = serving
+
+        latest = state["latestRevision"]
+
+        if serving and latest and serving != latest:
+            state["notes"].append(
+                "A newer revision (" + latest + ") exists but receives no traffic, "
+                "so it is not serving users."
+            )
+
+        return state
+
+    return cached("app-state:" + key, load)
+
+
+def probe_live(fqdn):
+    """Check the running app. /health goes first because it also wakes a sleeping app."""
+    base = "https://" + fqdn
+
+    health = azure_api.probe(base + "/health", timeout=45)
+
+    if not health["ok"]:
+        return health, {
+            "ok": False,
+            "status": 0,
+            "ms": 0,
+            "json": None,
+            "error": "skipped because /health did not answer",
+        }
+
+    info = azure_api.probe(base + "/api/info", timeout=30)
+
+    if not info.get("json"):
+        info = azure_api.probe(base + "/api/info", timeout=30)
+
+    return health, info
+
+
 def build_environment(key):
     cfg = config.ENVIRONMENTS[key]
     sub = azure_api.subscription_id()
@@ -290,174 +512,39 @@ def build_environment(key):
         f"/providers/Microsoft.OperationalInsights/workspaces/{cfg['workspace']}"
     )
 
+    state = read_app_state(key)
+
     data = {
         "key": key,
         "label": cfg["label"],
         "app": cfg["app"],
         "resourceGroup": cfg["resource_group"],
-        "errors": [],
+        "errors": list(state["errors"]),
+        "notes": list(state["notes"]),
         "links": {
             "app": _portal_link(app_id, "/overview"),
             "metrics": _portal_link(app_id, "/metrics"),
             "logs": _portal_link(app_id, "/logs"),
-            "applicationInsights": _portal_link(
-                insights_id, "/overview"
-            ),
+            "applicationInsights": _portal_link(insights_id, "/overview"),
             "workspace": _portal_link(workspace_id, "/logs"),
         },
+        "image": state["image"],
+        "imageTag": state["imageTag"],
+        "imageDigest": state["imageDigest"],
+        "provisioningState": state["provisioningState"],
+        "runningStatus": state["runningStatus"],
+        "latestRevision": state["latestRevision"],
+        "servingRevision": state["servingRevision"],
+        "url": state["url"],
+        "traffic": list(state["traffic"]),
+        "revisions": list(state["revisions"]),
     }
 
-    fqdn = None
-    traffic = []
-
-    try:
-        details = azure_api.container_app(key)
-        properties = details.get("properties") or {}
-
-        ingress = (
-            (properties.get("configuration") or {}).get("ingress") or {}
-        )
-
-        containers = (
-            (properties.get("template") or {}).get("containers") or [{}]
-        )
-
-        image = containers[0].get("image", "")
-        parts = analysis.image_parts(image)
-
-        fqdn = ingress.get("fqdn")
-
-        traffic = [
-            {
-                "revision": item.get("revisionName") or "latest",
-                "weight": item.get("weight") or 0,
-            }
-            for item in (ingress.get("traffic") or [])
-        ]
-
-        data.update(
-            {
-                "image": image,
-                "imageTag": parts["tag"],
-                "imageDigest": parts["digest"],
-                "provisioningState": properties.get("provisioningState"),
-                "runningStatus": properties.get("runningStatus"),
-                "latestRevision": properties.get("latestRevisionName"),
-                "url": ("https://" + fqdn) if fqdn else None,
-                "traffic": traffic,
-            }
-        )
-
-    except azure_api.ApiError as error:
-        data["errors"].append("Container App: " + error.message)
-
-    # Fetch revision-specific image information.
-    # The image shown must belong to the revision actually receiving traffic.
-    try:
-        revisions = azure_api.container_app_revisions(key)
-
-        revisions.sort(
-            key=lambda item: (
-                item.get("properties") or {}
-            ).get("createdTime") or "",
-            reverse=True,
-        )
-
-        revision_images = {}
-
-        for item in revisions:
-            props = item.get("properties") or {}
-
-            revision_containers = (
-                (props.get("template") or {}).get("containers") or []
-            )
-
-            revision_image = (
-                revision_containers[0].get("image", "")
-                if revision_containers
-                else ""
-            )
-
-            revision_images[item.get("name")] = revision_image
-
-        weighted_traffic = [
-            item
-            for item in traffic
-            if (item.get("weight") or 0) > 0
-        ]
-
-        latest_revision = data.get("latestRevision")
-        serving_images = set()
-
-        for item in weighted_traffic:
-            revision_name = item.get("revision")
-
-            if revision_name == "latest":
-                revision_name = latest_revision
-
-            serving_image = revision_images.get(revision_name, "")
-
-            if serving_image:
-                serving_images.add(serving_image)
-
-        if len(serving_images) == 1:
-            serving_image = next(iter(serving_images))
-            serving_parts = analysis.image_parts(serving_image)
-
-            data.update(
-                {
-                    "image": serving_image,
-                    "imageTag": serving_parts["tag"],
-                    "imageDigest": serving_parts["digest"],
-                }
-            )
-
-        elif len(serving_images) > 1:
-            data.update(
-                {
-                    "image": "Multiple images currently receiving traffic",
-                    "imageTag": None,
-                    "imageDigest": None,
-                }
-            )
-
-        elif not weighted_traffic:
-            data.update(
-                {
-                    "image": None,
-                    "imageTag": None,
-                    "imageDigest": None,
-                }
-            )
-
-        data["revisions"] = [
-            {
-                "name": item.get("name"),
-                "createdAt": (
-                    item.get("properties") or {}
-                ).get("createdTime"),
-                "active": (
-                    item.get("properties") or {}
-                ).get("active"),
-                "trafficWeight": (
-                    item.get("properties") or {}
-                ).get("trafficWeight"),
-                "health": (
-                    item.get("properties") or {}
-                ).get("healthState"),
-            }
-            for item in revisions[:6]
-        ]
-
-    except azure_api.ApiError as error:
-        data["errors"].append("Revisions: " + error.message)
-
-    # Check the real application endpoints.
+    fqdn = state["fqdn"]
     probe_ok = None
 
     if fqdn:
-        info = azure_api.probe("https://" + fqdn + "/api/info")
-        health = azure_api.probe("https://" + fqdn + "/health")
+        health, info = probe_live(fqdn)
 
         probe_ok = bool(health["ok"])
         body = info.get("json") or {}
@@ -469,14 +556,16 @@ def build_environment(key):
             "version": body.get("version"),
             "environment": body.get("environment"),
             "revision": body.get("revision"),
+            "infoOk": bool(info.get("json")),
+            "infoError": info.get("error"),
             "checkedAt": datetime.now(timezone.utc).isoformat(),
             "error": health.get("error"),
         }
 
     data["status"] = analysis.release_status(
         probe_ok,
-        traffic,
-        bool(data["errors"]) and not fqdn,
+        state["traffic"],
+        bool(state["errors"]) and not fqdn,
     )
 
     return data
@@ -682,9 +771,13 @@ def blocked_releases():
             if item.get("result") == "failed"
         ][:8]
 
-        result = []
+        if not failed:
+            return []
 
-        for build in failed:
+        # Get the sign-in token once, before the parallel lookups.
+        azure_api.get_token(azure_api.RESOURCE_DEVOPS)
+
+        def describe(build):
             run = analysis.summarize_build(build)
 
             try:
@@ -701,9 +794,10 @@ def blocked_releases():
             run["failedStep"] = step["name"]
             run["category"] = step["category"]
 
-            result.append(run)
+            return run
 
-        return result
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            return list(pool.map(describe, failed))
 
     return cached("blocked-releases", load)
 
@@ -769,7 +863,6 @@ def find_scan_for_digest(records, live_digest):
 @api_errors
 def security():
     events = load_deployment_events()["events"]
-    environment_data = load_environments()
 
     all_records = [
         security_scan_record(event, event["env"])
@@ -784,9 +877,10 @@ def security():
 
     deployed_images = []
 
-    for env in environment_data["environments"]:
-        key = env["key"]
-        live_digest = normalize_digest(env.get("imageDigest"))
+    for key, cfg in config.ENVIRONMENTS.items():
+        # Only Azure Resource Manager is asked here: no call to the running app.
+        state = read_app_state(key)
+        live_digest = normalize_digest(state.get("imageDigest"))
 
         env_records = [
             record for record in all_records
@@ -803,13 +897,14 @@ def security():
         deployed_images.append(
             {
                 "env": key,
-                "label": env["label"],
-                "liveImage": env.get("image"),
-                "liveImageDigest": env.get("imageDigest"),
+                "label": cfg["label"],
+                "liveImage": state.get("image"),
+                "liveImageDigest": state.get("imageDigest"),
                 "verification": "MATCH" if matching_scan else "UNVERIFIED",
                 "matchedBy": matched_by,
                 "deployedImageScan": matching_scan,
                 "latestScan": latest_scan,
+                "errors": state.get("errors", []),
             }
         )
 
@@ -1119,8 +1214,23 @@ def action_deploy():
 
 # ---------------------------------------------------------------- startup
 
+def warm_up_tokens():
+    """Fetch the three Azure sign-in tokens once, in the background, so the first page load is quicker."""
+    for resource in (
+        azure_api.RESOURCE_ARM,
+        azure_api.RESOURCE_LOGS,
+        azure_api.RESOURCE_DEVOPS,
+    ):
+        try:
+            azure_api.get_token(resource)
+        except azure_api.ApiError:
+            pass
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
+
+    threading.Thread(target=warm_up_tokens, daemon=True).start()
 
     if config.AUTH_MODE == "local":
         admin_link = (
