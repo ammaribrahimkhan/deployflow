@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+pytest.ini
+requirements-dev.txt
+run-local.ps1
+Dockerfile
+.dockerignore
