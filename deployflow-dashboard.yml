@@ -1,0 +1,360 @@
+# DeployFlow dashboard pipeline (Milestone 8B)
+#
+# Pull requests: security scan, lint, static analysis, dependency audit, unit tests.
+# Pushes to main: the same, then build, smoke test of the sign-in rules, image scan, SBOM,
+# push to the registry and deploy to the dashboard app (if it exists yet).
+# Azure credentials exist only in the final push-and-deploy step.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - dashboard/*
+      - azure-pipelines-dashboard.yml
+      - pipelines/*
+      - scripts/*
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - dashboard/*
+      - azure-pipelines-dashboard.yml
+
+pool:
+  name: deployflow-laptop-pool
+
+variables:
+  - template: pipelines/variables.yml
+  - name: acrName
+    value: acrdeployflowsharedammar03
+  - name: acrLoginServer
+    value: acrdeployflowsharedammar03.azurecr.io
+  - name: imageName
+    value: deployflow-dashboard
+  - name: azureServiceConnection
+    value: sc-azure-deployflow
+  - name: dashboardApp
+    value: ca-deployflow-dashboard
+  - name: dashboardResourceGroup
+    value: rg-deployflow-dashboard-eus2
+  - name: PIP_RETRIES
+    value: 5
+  - name: PIP_DEFAULT_TIMEOUT
+    value: 100
+
+stages:
+  - stage: Test
+    displayName: Security scans, lint and unit tests
+    jobs:
+      - job: Test
+        displayName: Security scans, lint and unit tests
+        steps:
+          - checkout: self
+            clean: true
+
+          - powershell: |
+              $required = @("react.production.min.js", "react-dom.production.min.js", "htm.umd.js")
+              $missing = @()
+              foreach ($name in $required) {
+                if (-not (Test-Path (Join-Path "dashboard\web\vendor" $name))) { $missing += $name }
+              }
+              if ($missing.Count -gt 0) {
+                $names = $missing -join ", "
+                Write-Host "##vso[task.logissue type=error]Missing React files: $names. Run scripts\vendor-dashboard-assets.ps1 and commit dashboard\web\vendor."
+                exit 1
+              }
+            displayName: Check the vendored React files exist
+
+          - powershell: |
+              & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("fs", "--scanners", "vuln,secret", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1", "--skip-dirs", "**/.venv", "dashboard")
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "##vso[task.logissue type=error]Dashboard source scan failed: HIGH/CRITICAL vulnerability or secret found."
+                exit 1
+              }
+            displayName: Scan dashboard source for secrets and vulnerable dependencies (Trivy)
+
+          - powershell: |
+              py --version
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Python launcher not found."; exit 1 }
+              py -m venv .venv
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Virtual environment creation failed."; exit 1 }
+              .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Dependency installation failed."; exit 1 }
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Install dependencies
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m ruff check .
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Ruff lint check failed."; exit 1 }
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Code quality (ruff)
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m bandit -r main.py analysis.py azure_api.py config.py -ll
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Bandit found medium or higher issues."; exit 1 }
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Static security analysis (bandit)
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m pip_audit -r requirements.txt --progress-spinner off
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]pip-audit found a vulnerable dependency."; exit 1 }
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Python dependency audit (pip-audit)
+
+          - powershell: |
+              .\.venv\Scripts\python.exe -m pytest --junitxml=test-results.xml
+              if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Unit tests failed."; exit 1 }
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Unit tests (pytest)
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: dashboard/test-results.xml
+              testRunTitle: DeployFlow dashboard tests
+
+  - stage: BuildDeploy
+    displayName: Build, scan, push and deploy
+    dependsOn: Test
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: BuildDeploy
+        displayName: Build, scan, push, deploy
+        steps:
+          - checkout: self
+            clean: true
+
+          # Step A: build the image and prove the sign-in rules work. No Azure credentials here.
+          - powershell: |
+              function Fail($message) {
+                Write-Host "##vso[task.logissue type=error]$message"
+                exit 1
+              }
+
+              $sha = "$(Build.SourceVersion)".Substring(0, 7)
+              $image = "$(acrLoginServer)/$(imageName)"
+              $tag = "${image}:$sha"
+              $container = "df-dash-smoke-$(Build.BuildId)"
+
+              # Download the base image, retrying on network errors.
+              $fromMatch = Select-String -Path "Dockerfile" -Pattern '^\s*FROM\s+(\S+)' | Select-Object -First 1
+              if (-not $fromMatch) { Fail "No FROM line in the Dockerfile." }
+              $baseImage = $fromMatch.Matches[0].Groups[1].Value
+
+              $pulled = $false
+              for ($attempt = 1; $attempt -le 4; $attempt++) {
+                docker pull $baseImage
+                if ($LASTEXITCODE -eq 0) { $pulled = $true; break }
+                Write-Host "docker pull failed (attempt $attempt of 4)."
+                if ($attempt -lt 4) { Start-Sleep -Seconds (15 * $attempt) }
+              }
+              $cachedLocally = $false
+              if (-not $pulled) {
+                docker image inspect $baseImage | Out-Null
+                if ($LASTEXITCODE -ne 0) { Fail "Could not download the base image and it is not cached on this machine." }
+                $cachedLocally = $true
+              }
+
+              # Build, retrying; fall back to the classic builder if the registry lookup keeps failing.
+              $buildArgs = @(
+                "build",
+                "--build-arg", "APP_VERSION=1.0.$(Build.BuildId)",
+                "--build-arg", "GIT_SHA=$sha",
+                "--label", "org.opencontainers.image.revision=$(Build.SourceVersion)",
+                "--label", "org.opencontainers.image.source=$(Build.Repository.Uri)",
+                "--label", "deployflow.build.id=$(Build.BuildId)",
+                "--tag", $tag,
+                "."
+              )
+              $built = $false
+              $useLegacy = $cachedLocally
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                if ($useLegacy) { $env:DOCKER_BUILDKIT = "0" } else { $env:DOCKER_BUILDKIT = "1" }
+                & docker @buildArgs
+                if ($LASTEXITCODE -eq 0) { $built = $true; break }
+                if ($attempt -eq 2) { $useLegacy = $true }
+                if ($attempt -lt 3) { Start-Sleep -Seconds (15 * $attempt) }
+              }
+              Remove-Item Env:DOCKER_BUILDKIT -ErrorAction SilentlyContinue
+              if (-not $built) { Fail "docker build failed." }
+
+              # Smoke test: run the image in Entra mode and check the sign-in rules.
+              docker run -d --name $container -p 18090:3000 -e DASHBOARD_AUTH_MODE=easyauth -e DASHBOARD_ADMINS=admin@example.com $tag | Out-Null
+              if ($LASTEXITCODE -ne 0) { Fail "The container did not start (is port 18090 in use?)." }
+
+              $failure = $null
+              $healthy = $false
+              for ($i = 1; $i -le 30; $i++) {
+                try {
+                  $r = Invoke-WebRequest -Uri "http://127.0.0.1:18090/healthz" -UseBasicParsing -TimeoutSec 2
+                  if ($r.StatusCode -eq 200) { $healthy = $true; break }
+                } catch {
+                  Start-Sleep -Seconds 1
+                }
+              }
+
+              if (-not $healthy) {
+                $failure = "Smoke test failed: /healthz never answered."
+                docker logs $container
+              } else {
+                $blockedCode = 0
+                try {
+                  $null = Invoke-WebRequest -Uri "http://127.0.0.1:18090/api/me" -UseBasicParsing -TimeoutSec 5
+                  $blockedCode = 200
+                } catch {
+                  if ($_.Exception.Response) { $blockedCode = [int]$_.Exception.Response.StatusCode }
+                }
+
+                if ($blockedCode -ne 401) {
+                  $failure = "Smoke test failed: /api/me without a sign-in should return 401 but returned $blockedCode."
+                } else {
+                  $viewerHeaders = @{ "X-MS-CLIENT-PRINCIPAL-NAME" = "someone@example.com" }
+                  $adminHeaders = @{ "X-MS-CLIENT-PRINCIPAL-NAME" = "admin@example.com" }
+                  $viewer = Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/me" -Headers $viewerHeaders -TimeoutSec 5
+                  $admin = Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/me" -Headers $adminHeaders -TimeoutSec 5
+                  $page = Invoke-WebRequest -Uri "http://127.0.0.1:18090/" -Headers $viewerHeaders -UseBasicParsing -TimeoutSec 5
+                  $react = Invoke-WebRequest -Uri "http://127.0.0.1:18090/static/vendor/react.production.min.js" -Headers $viewerHeaders -UseBasicParsing -TimeoutSec 5
+
+                  if ($viewer.role -ne "viewer" -or $admin.role -ne "admin") {
+                    $failure = "Smoke test failed: roles are wrong (viewer: $($viewer.role), admin: $($admin.role))."
+                  } elseif ($page.StatusCode -ne 200 -or $page.Content -notmatch "DeployFlow dashboard") {
+                    $failure = "Smoke test failed: the dashboard page did not load."
+                  } elseif ($react.StatusCode -ne 200) {
+                    $failure = "Smoke test failed: the React files are not inside the image."
+                  } else {
+                    Write-Host "Smoke test passed: sign-in rules, roles and the page all work."
+                  }
+                }
+              }
+
+              docker rm -f $container | Out-Null
+              if ($failure) { Fail $failure }
+
+              Write-Host "##vso[task.setvariable variable=imageSha]$sha"
+              Write-Host "##vso[task.setvariable variable=imageTag]$tag"
+            workingDirectory: $(Build.SourcesDirectory)\dashboard
+            displayName: Build image and smoke test the sign-in rules
+
+          # Step B: vulnerability gate and SBOM. No Azure credentials here.
+          - powershell: |
+              function Fail($message) {
+                Write-Host "##vso[task.logissue type=error]$message"
+                exit 1
+              }
+
+              $src = "$(Build.SourcesDirectory)"
+              $reports = "$(Build.ArtifactStagingDirectory)\reports"
+              $tarDir = "$(Agent.TempDirectory)"
+              $tar = Join-Path $tarDir "dashboard-image.tar"
+              $trivy = "$(trivyImage)"
+
+              New-Item -ItemType Directory -Force -Path $reports | Out-Null
+              Write-Host "##vso[task.setvariable variable=reportsReady]true"
+
+              docker save -o $tar "$(imageTag)"
+              if ($LASTEXITCODE -ne 0) { Fail "docker save failed." }
+
+              & .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -InputDir $tarDir -OutDir $reports -TrivyArgs @("image", "--input", "/in/dashboard-image.tar", "--format", "cyclonedx", "--output", "/out/dashboard-sbom.cdx.json")
+              if ($LASTEXITCODE -ne 0) { Fail "SBOM generation failed." }
+
+              & .\scripts\run-trivy.ps1 -TrivyImage $trivy -SourceDir $src -InputDir $tarDir -TrivyArgs @("image", "--input", "/in/dashboard-image.tar", "--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1")
+              $gateExit = $LASTEXITCODE
+
+              Remove-Item $tar -Force -ErrorAction SilentlyContinue
+
+              if ($gateExit -ne 0) { Fail "Image scan failed: HIGH or CRITICAL fixable vulnerabilities. The image was NOT pushed." }
+              Write-Host "Image scan passed. SBOM written to $reports"
+            workingDirectory: $(Build.SourcesDirectory)
+            displayName: Scan the image (Trivy gate) and create the SBOM
+
+          # Step C: the only step with Azure credentials.
+          - task: AzureCLI@2
+            displayName: Push the scanned image and deploy it to the dashboard app
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: ps
+              scriptLocation: inlineScript
+              failOnStandardError: false
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                function Fail($message) {
+                  Write-Host "##vso[task.logissue type=error]$message"
+                  exit 1
+                }
+
+                $sha = "$(imageSha)"
+                $tag = "$(imageTag)"
+
+                az acr login --name $(acrName)
+                if ($LASTEXITCODE -ne 0) { Fail "az acr login failed." }
+
+                docker push $tag
+                if ($LASTEXITCODE -ne 0) { Fail "docker push failed." }
+
+                $digest = az acr repository show --name $(acrName) --image "$(imageName):$sha" --query digest -o tsv
+                if ($LASTEXITCODE -ne 0 -or -not $digest) { Fail "Could not read the image digest." }
+                $ref = "$(acrLoginServer)/$(imageName)@$digest"
+                Write-Host "Pushed $ref"
+
+                $exists = az containerapp show --name $(dashboardApp) --resource-group $(dashboardResourceGroup) --query name -o tsv 2>$null
+                if ($LASTEXITCODE -ne 0 -or -not $exists) {
+                  Write-Host "The dashboard app does not exist yet. The image is pushed. Create the app with Terraform (Milestone 8B, Part 3). Nothing to deploy."
+                  exit 0
+                }
+
+                az containerapp update --name $(dashboardApp) --resource-group $(dashboardResourceGroup) --image $ref --revision-suffix "b$(Build.BuildId)-a$(System.JobAttempt)" --output none
+                if ($LASTEXITCODE -ne 0) { Fail "az containerapp update failed." }
+
+                $stateText = (az containerapp show --name $(dashboardApp) --resource-group $(dashboardResourceGroup) --query "{fqdn:properties.configuration.ingress.fqdn, image:properties.template.containers[0].image, state:properties.provisioningState}" -o json | Out-String)
+                $state = ConvertFrom-Json $stateText
+                if ($state.state -ne "Succeeded") { Fail "Provisioning state is '$($state.state)'." }
+                if ($state.image -ne $ref) { Fail "The app runs '$($state.image)' but '$ref' was expected." }
+
+                $url = "https://" + $state.fqdn
+
+                # The health path is excluded from sign-in so the platform and this pipeline can check it.
+                $healthy = $false
+                for ($i = 1; $i -le 30; $i++) {
+                  try {
+                    $r = Invoke-WebRequest -Uri "$url/healthz" -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 0
+                    if ($r.StatusCode -eq 200) { $healthy = $true; break }
+                  } catch {
+                    Write-Host "Waiting for the new revision..."
+                  }
+                  Start-Sleep -Seconds 4
+                }
+                if (-not $healthy) { Fail "$url/healthz did not return 200. Check that /healthz is excluded from sign-in (Milestone 8B, Part 4)." }
+
+                # Visitors who are not signed in must NOT get data.
+                $code = 0
+                try {
+                  $r = Invoke-WebRequest -Uri "$url/api/me" -UseBasicParsing -TimeoutSec 20 -MaximumRedirection 0
+                  $code = [int]$r.StatusCode
+                } catch {
+                  if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                }
+                if ($code -eq 200) { Fail "SECURITY: /api/me answered 200 without a sign-in." }
+                Write-Host "Deployed $ref. /api/me without a sign-in was refused (status $code)."
+
+          - publish: $(Build.ArtifactStagingDirectory)/reports
+            artifact: dashboard-evidence
+            condition: and(always(), eq(variables['reportsReady'], 'true'))
+            displayName: Publish the SBOM
+
+          - powershell: |
+              $tar = Join-Path "$(Agent.TempDirectory)" "dashboard-image.tar"
+              if (Test-Path $tar) { Remove-Item $tar -Force }
+              docker rm -f "df-dash-smoke-$(Build.BuildId)" 2>&1 | Out-Null
+              docker logout $(acrLoginServer) 2>&1 | Out-Null
+              exit 0
+            condition: always()
+            displayName: Clean up
