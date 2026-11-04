@@ -1,4 +1,4 @@
-# DeployFlow dashboard pipeline (Milestone 8B)
+# DeployFlow dashboard pipeline (Milestone 8B, updated in Milestone 9)
 #
 # Pull requests: security scan, lint, static analysis, dependency audit, unit tests.
 # Pushes to main: the same, then build, smoke test of the sign-in rules, image scan, SBOM,
@@ -97,7 +97,7 @@ stages:
             displayName: Code quality (ruff)
 
           - powershell: |
-              .\.venv\Scripts\python.exe -m bandit -r main.py analysis.py azure_api.py config.py -ll
+              .\.venv\Scripts\python.exe -m bandit -r cost.py main.py analysis.py azure_api.py config.py server.py -ll
               if ($LASTEXITCODE -ne 0) { Write-Host "##vso[task.logissue type=error]Bandit found medium or higher issues."; exit 1 }
             workingDirectory: $(Build.SourcesDirectory)\dashboard
             displayName: Static security analysis (bandit)
@@ -214,8 +214,16 @@ stages:
                   if ($_.Exception.Response) { $blockedCode = [int]$_.Exception.Response.StatusCode }
                 }
 
-                if ($blockedCode -ne 401) {
-                  $failure = "Smoke test failed: /api/me without a sign-in should return 401 but returned $blockedCode."
+                $costCode = 0
+                try {
+                  $null = Invoke-WebRequest -Uri "http://127.0.0.1:18090/api/cost" -UseBasicParsing -TimeoutSec 5
+                  $costCode = 200
+                } catch {
+                  if ($_.Exception.Response) { $costCode = [int]$_.Exception.Response.StatusCode }
+                }
+
+                if ($blockedCode -ne 401 -or $costCode -ne 401) {
+                  $failure = "Smoke test failed: requests without a sign-in must return 401 (api/me: $blockedCode, api/cost: $costCode)."
                 } else {
                   $viewerHeaders = @{ "X-MS-CLIENT-PRINCIPAL-NAME" = "someone@example.com" }
                   $adminHeaders = @{ "X-MS-CLIENT-PRINCIPAL-NAME" = "admin@example.com" }
@@ -223,13 +231,14 @@ stages:
                   $admin = Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/me" -Headers $adminHeaders -TimeoutSec 5
                   $page = Invoke-WebRequest -Uri "http://127.0.0.1:18090/" -Headers $viewerHeaders -UseBasicParsing -TimeoutSec 5
                   $react = Invoke-WebRequest -Uri "http://127.0.0.1:18090/static/vendor/react.production.min.js" -Headers $viewerHeaders -UseBasicParsing -TimeoutSec 5
+                  $costScript = Invoke-WebRequest -Uri "http://127.0.0.1:18090/static/cost.js" -Headers $viewerHeaders -UseBasicParsing -TimeoutSec 5
 
                   if ($viewer.role -ne "viewer" -or $admin.role -ne "admin") {
                     $failure = "Smoke test failed: roles are wrong (viewer: $($viewer.role), admin: $($admin.role))."
                   } elseif ($page.StatusCode -ne 200 -or $page.Content -notmatch "DeployFlow dashboard") {
                     $failure = "Smoke test failed: the dashboard page did not load."
-                  } elseif ($react.StatusCode -ne 200) {
-                    $failure = "Smoke test failed: the React files are not inside the image."
+                  } elseif ($react.StatusCode -ne 200 -or $costScript.StatusCode -ne 200) {
+                    $failure = "Smoke test failed: the React or cost script files are not inside the image."
                   } else {
                     Write-Host "Smoke test passed: sign-in rules, roles and the page all work."
                   }

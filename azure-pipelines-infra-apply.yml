@@ -1,0 +1,91 @@
+# DeployFlow infrastructure change pipeline (Milestone 9)
+#
+# Manual only. Plan first (changes nothing), safety checks, then, if you ticked "Apply",
+# a human approval, then the SAME saved plan is applied. No plan, no apply.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: stack
+    displayName: Terraform stack
+    type: string
+    default: envs/staging
+    values:
+      - shared
+      - envs/dev
+      - envs/staging
+      - envs/prod
+      - envs/dashboard
+  - name: apply
+    displayName: Apply after approval (unticked = plan only)
+    type: boolean
+    default: false
+  - name: allowDestroy
+    displayName: Allow the plan to delete protected resources (registry, resource groups, workspaces)
+    type: boolean
+    default: false
+
+pool:
+  name: deployflow-laptop-pool
+
+variables:
+  - name: azureTerraformConnection
+    value: sc-azure-terraform
+
+stages:
+  - stage: Plan
+    displayName: Plan (nothing is changed)
+    jobs:
+      - job: PlanJob
+        displayName: Plan and safety checks
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            name: plan
+            displayName: Terraform plan, safety checks and summary
+            inputs:
+              azureSubscription: $(azureTerraformConnection)
+              scriptType: ps
+              scriptLocation: scriptPath
+              scriptPath: $(Build.SourcesDirectory)\scripts\terraform-plan.ps1
+              arguments: -Stack "${{ parameters.stack }}" -OutputDir "$(Build.ArtifactStagingDirectory)\infra-plan" -AlertEmail "$(alertEmail)" -DashboardAdmins "$(dashboardAdmins)" -AllowDestroy "${{ parameters.allowDestroy }}"
+              failOnStandardError: false
+              workingDirectory: $(Build.SourcesDirectory)
+
+          - publish: $(Build.ArtifactStagingDirectory)/infra-plan
+            artifact: infra-plan
+            displayName: Publish the plan (read plan.txt before approving)
+
+  - stage: Apply
+    displayName: Apply the approved plan
+    dependsOn: Plan
+    condition: and(succeeded(), eq('${{ parameters.apply }}', 'true'), eq(dependencies.Plan.outputs['PlanJob.plan.hasChanges'], 'true'))
+    jobs:
+      - deployment: ApplyJob
+        displayName: Apply the saved plan
+        environment: infrastructure
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - download: current
+                  artifact: infra-plan
+
+                - task: AzureCLI@2
+                  displayName: Terraform apply (saved plan only)
+                  inputs:
+                    azureSubscription: $(azureTerraformConnection)
+                    scriptType: ps
+                    scriptLocation: scriptPath
+                    scriptPath: $(Build.SourcesDirectory)\scripts\terraform-apply.ps1
+                    arguments: -Stack "${{ parameters.stack }}" -PlanPath "$(Pipeline.Workspace)\infra-plan\tfplan" -AlertEmail "$(alertEmail)" -DashboardAdmins "$(dashboardAdmins)"
+                    failOnStandardError: false
+                    workingDirectory: $(Build.SourcesDirectory)
