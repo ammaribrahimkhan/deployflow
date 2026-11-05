@@ -1,0 +1,2 @@
+﻿# No vulnerability exceptions are currently approved.
+# Add specific Trivy vulnerability IDs here only after reviewing and documenting an exception.

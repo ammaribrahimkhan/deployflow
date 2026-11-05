@@ -1,3 +1,4 @@
+
 # DeployFlow infrastructure checks (Milestone 5)
 #
 # Checks Terraform formatting, security misconfigurations and validity.
@@ -38,44 +39,95 @@ steps:
   - checkout: self
     clean: true
 
+  # Terraform version
   - powershell: |
-      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
+      $terraformCommand = Get-Command terraform -ErrorAction SilentlyContinue
+
+      if (-not $terraformCommand) {
+          $terraformExe = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" `
+              -Filter terraform.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if ($terraformExe) {
+              $env:PATH = "$($terraformExe.DirectoryName);$env:PATH"
+          }
+      }
+
       terraform version
+
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]terraform not found on the agent. Install it, then restart the agent."
-        exit 1
+          Write-Host "##vso[task.logissue type=error]Terraform not found on the agent. Install it, then restart the agent."
+          exit 1
       }
     displayName: Terraform version
 
+  # Terraform format check
   - powershell: |
-      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
+      $terraformCommand = Get-Command terraform -ErrorAction SilentlyContinue
+
+      if (-not $terraformCommand) {
+          $terraformExe = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" `
+              -Filter terraform.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if ($terraformExe) {
+              $env:PATH = "$($terraformExe.DirectoryName);$env:PATH"
+          }
+      }
+
+      if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
+          Write-Host "##vso[task.logissue type=error]Terraform not found on the agent."
+          exit 1
+      }
+
       terraform fmt -check -recursive -diff
+
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]Formatting problems found. Run: terraform fmt -recursive"
-        exit 1
+          Write-Host "##vso[task.logissue type=error]Formatting problems found. Run: terraform fmt -recursive"
+          exit 1
       }
     workingDirectory: infra
     displayName: Terraform format check
 
+  # Trivy Terraform security scan
   - powershell: |
-      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
       Write-Host "=== Informational: HIGH and CRITICAL findings (do not block) ==="
+
       & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("config", "--severity", "HIGH,CRITICAL", "--exit-code", "0", "infra")
+
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]Trivy could not scan the Terraform code (see the log above)"
-        exit 1
+          Write-Host "##vso[task.logissue type=error]Trivy could not scan the Terraform code (see the log above)"
+          exit 1
       }
 
       Write-Host "=== Gate: CRITICAL findings block ==="
+
       & .\scripts\run-trivy.ps1 -TrivyImage "$(trivyImage)" -SourceDir "$(Build.SourcesDirectory)" -TrivyArgs @("config", "--severity", "CRITICAL", "--exit-code", "1", "infra")
+
       if ($LASTEXITCODE -ne 0) {
-        Write-Host "##vso[task.logissue type=error]CRITICAL infrastructure misconfiguration found"
-        exit 1
+          Write-Host "##vso[task.logissue type=error]CRITICAL infrastructure misconfiguration found"
+          exit 1
       }
     displayName: Scan Terraform for misconfigurations (Trivy)
 
+  # Terraform initialization and validation
   - powershell: |
-      $env:PATH = "C:\Users\Hp\AppData\Local\Microsoft\WinGet\Packages\Hashicorp.Terraform_Microsoft.Winget.Source_8wekyb3d8bbwe;$env:PATH"
+      $terraformCommand = Get-Command terraform -ErrorAction SilentlyContinue
+
+      if (-not $terraformCommand) {
+          $terraformExe = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" `
+              -Filter terraform.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if ($terraformExe) {
+              $env:PATH = "$($terraformExe.DirectoryName);$env:PATH"
+          }
+      }
+
+      if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
+          Write-Host "##vso[task.logissue type=error]Terraform not found on the agent."
+          exit 1
+      }
 
       # Shared provider cache: azurerm is downloaded once and reused by every stack and every run
       $cache = "C:\agent\terraform-plugin-cache"
@@ -83,31 +135,41 @@ steps:
       $env:TF_PLUGIN_CACHE_DIR = $cache
 
       $stacks = @("shared", "envs/dev", "envs/staging", "envs/prod")
+
       foreach ($stack in $stacks) {
-        Write-Host "=== Validating $stack ==="
-        Push-Location $stack
+          Write-Host "=== Validating $stack ==="
+          Push-Location $stack
 
-        # Retry init: the provider download can time out on a weak connection
-        $initOk = $false
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-          terraform init -backend=false -input=false
-          if ($LASTEXITCODE -eq 0) { $initOk = $true; break }
-          Write-Host "terraform init attempt $attempt failed. Retrying in $($attempt * 15) seconds..."
-          Start-Sleep -Seconds ($attempt * 15)
-        }
-        if (-not $initOk) {
-          Pop-Location
-          Write-Host "##vso[task.logissue type=error]terraform init failed in $stack after 5 attempts"
-          exit 1
-        }
+          # Retry init: the provider download can time out on a weak connection
+          $initOk = $false
 
-        terraform validate
-        if ($LASTEXITCODE -ne 0) {
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+              terraform init -backend=false -input=false
+
+              if ($LASTEXITCODE -eq 0) {
+                  $initOk = $true
+                  break
+              }
+
+              Write-Host "terraform init attempt $attempt failed. Retrying in $($attempt * 15) seconds..."
+              Start-Sleep -Seconds ($attempt * 15)
+          }
+
+          if (-not $initOk) {
+              Pop-Location
+              Write-Host "##vso[task.logissue type=error]terraform init failed in $stack after 5 attempts"
+              exit 1
+          }
+
+          terraform validate
+
+          if ($LASTEXITCODE -ne 0) {
+              Pop-Location
+              Write-Host "##vso[task.logissue type=error]terraform validate failed in $stack"
+              exit 1
+          }
+
           Pop-Location
-          Write-Host "##vso[task.logissue type=error]terraform validate failed in $stack"
-          exit 1
-        }
-        Pop-Location
       }
     workingDirectory: infra
     displayName: Terraform validate

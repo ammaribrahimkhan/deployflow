@@ -9,7 +9,9 @@ const NETWORK_MESSAGE =
 const SIGNED_OUT_MESSAGE =
   "You are signed out (the dashboard was restarted). Use the new tab that opens when it starts.";
 
-// ---------------------------------------------------------------- helpers
+// --------------------------------------------------
+// Helpers
+// --------------------------------------------------
 
 function safeUrl(url) {
   return typeof url === "string" && url.startsWith("https://") ? url : null;
@@ -36,41 +38,24 @@ function percent(value) {
   return value === null || value === undefined ? "-" : value + "%";
 }
 
-// Colours: good = green, warn = amber, bad = red, muted = grey.
 function kindOf(text) {
   const value = String(text || "").toLowerCase();
 
   if ([
-    "healthy",
-    "succeeded",
-    "success",
-    "promoted",
-    "deployed",
-    "passed",
-    "resolved",
-    "closed"
+    "healthy", "succeeded", "success", "promoted",
+    "deployed", "passed", "resolved", "closed"
   ].includes(value)) return "good";
 
   if ([
-    "failed",
-    "unreachable",
-    "rollback_failed",
-    "aborted_before_traffic",
-    "failed_before_deploy",
-    "failed_before_traffic",
-    "fired"
+    "failed", "unreachable", "rollback_failed",
+    "aborted_before_traffic", "failed_before_deploy",
+    "failed_before_traffic", "fired"
   ].includes(value)) return "bad";
 
   if ([
-    "release in progress",
-    "inprogress",
-    "partiallysucceeded",
-    "promoted_with_cleanup_warning",
-    "new",
-    "acknowledged",
-    "rollback",
-    "rolled_back",
-    "noop_already_live"
+    "release in progress", "inprogress", "partiallysucceeded",
+    "promoted_with_cleanup_warning", "new", "acknowledged",
+    "rollback", "rolled_back", "noop_already_live"
   ].includes(value)) return "warn";
 
   return "muted";
@@ -107,19 +92,14 @@ function deploymentOutcome(event) {
   }
 
   if ([
-    "failed",
-    "rollback_failed",
-    "aborted_before_traffic",
-    "failed_before_deploy",
-    "failed_before_traffic"
+    "failed", "rollback_failed", "aborted_before_traffic",
+    "failed_before_deploy", "failed_before_traffic"
   ].includes(outcome)) {
     return { label: "Failed", kind: "bad" };
   }
 
   if ([
-    "noop_already_live",
-    "already_live",
-    "already_deployed"
+    "noop_already_live", "already_live", "already_deployed"
   ].includes(outcome)) {
     return { label: "No action needed", kind: "muted" };
   }
@@ -129,6 +109,10 @@ function deploymentOutcome(event) {
     kind: kindOf(outcome)
   };
 }
+
+// --------------------------------------------------
+// API
+// --------------------------------------------------
 
 async function fetchJson(path, options) {
   let response;
@@ -196,17 +180,21 @@ function useApi(path, intervalMs) {
     if (!intervalMs) return undefined;
 
     const timer = setInterval(load, intervalMs);
-
     return () => clearInterval(timer);
   }, [load, intervalMs]);
 
   return { ...state, reload: load };
 }
 
-// ---------------------------------------------------------------- small components
+// --------------------------------------------------
+// Basic components
+// --------------------------------------------------
 
 function Badge({ kind, children }) {
-  return html`<span className=${"badge " + (kind || "muted")}>${children}</span>`;
+  return html`
+    <span className=${"badge " + (kind || "muted")}>
+      ${children}
+    </span>`;
 }
 
 function Ext({ href, children }) {
@@ -216,22 +204,40 @@ function Ext({ href, children }) {
     return html`<span className="muted">${children}</span>`;
   }
 
-  return html`<a href=${url} target="_blank" rel="noopener noreferrer">${children}</a>`;
+  return html`
+    <a href=${url} target="_blank" rel="noopener noreferrer">
+      ${children}
+    </a>`;
 }
 
-function Panel({ title, state, wide, children }) {
+function Panel({ title, state, wide, children, id }) {
   const stale = state.error && state.data;
 
   return html`
-    <section className=${"panel" + (wide ? " wide" : "")}>
+    <section
+      id=${id || undefined}
+      className=${"panel" + (wide ? " wide" : "")}
+    >
       <h2>${title}</h2>
+
       ${state.error
-        ? html`<p className="error">${state.error}${stale ? " Showing the last data received at " + formatTime(state.updated) + "." : ""}</p>`
+        ? html`
+          <p className="error">
+            ${state.error}
+            ${stale
+              ? " Showing the last data received at " +
+                formatTime(state.updated) + "."
+              : ""}
+          </p>`
         : null}
+
       ${state.data
         ? children
         : state.loading
-          ? html`<p className="muted">Loading... (the first load can take up to a minute while the apps wake up)</p>`
+          ? html`
+            <p className="muted">
+              Loading... (the first load can take up to a minute while the apps wake up)
+            </p>`
           : null}
     </section>`;
 }
@@ -245,6 +251,117 @@ function Kpi({ label, value, hint }) {
     </div>`;
 }
 
+// --------------------------------------------------
+// Circular charts
+// --------------------------------------------------
+
+function DonutChart({
+  title,
+  value,
+  percent: percentage,
+  color = "#7657ff",
+  subtitle = ""
+}) {
+  const amount = Math.max(
+    0,
+    Math.min(100, Number(percentage) || 0)
+  );
+
+  return html`
+    <article className="visual-card donut-card">
+
+      <div className="visual-card-header">
+        <div>
+          <h3>${title}</h3>
+          <p>${subtitle}</p>
+        </div>
+
+        <span
+          className="chart-indicator"
+          style=${{ background: color }}
+        ></span>
+      </div>
+
+      <div className="donut-container">
+        <div
+          className="donut-chart"
+          style=${{
+            "--chart-color": color,
+            "--chart-percent": amount + "%"
+          }}
+        >
+          <div className="donut-center">
+            <strong>${value}</strong>
+            <span>${amount.toFixed(1)}%</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="donut-footer">
+        <span>
+          <i style=${{ background: color }}></i>
+          Success rate
+        </span>
+
+        <strong>${amount.toFixed(1)}%</strong>
+      </div>
+    </article>`;
+}
+
+// --------------------------------------------------
+// Animated bar chart
+// --------------------------------------------------
+
+function MiniBarChart({ title, subtitle, items }) {
+  const maxValue = Math.max(
+    1,
+    ...items.map(item => Number(item.value) || 0)
+  );
+
+  return html`
+    <article className="visual-card">
+
+      <div className="visual-card-header">
+        <div>
+          <h3>${title}</h3>
+          <p>${subtitle}</p>
+        </div>
+
+        <span className="chart-icon">▥</span>
+      </div>
+
+      <div className="mini-chart">
+        ${items.map((item, index) => html`
+          <div className="mini-chart-row" key=${item.label}>
+
+            <div className="mini-chart-label">
+              <span>${item.label}</span>
+              <strong>${item.value}</strong>
+            </div>
+
+            <div className="mini-chart-track">
+              <div
+                className="mini-chart-fill"
+                style=${{
+                  "--bar-width":
+                    ((Number(item.value) || 0) / maxValue * 100) + "%",
+                  "--bar-color": item.color || "#7657ff",
+                  "--bar-delay": (index * 100) + "ms"
+                }}
+              ></div>
+            </div>
+
+          </div>
+        `)}
+      </div>
+
+    </article>`;
+}
+
+// --------------------------------------------------
+// Server monitoring
+// --------------------------------------------------
+
 function ServerBanner({ onRecovered }) {
   const [down, setDown] = useState(false);
 
@@ -254,7 +371,9 @@ function ServerBanner({ onRecovered }) {
 
     async function check() {
       try {
-        const response = await fetch("/healthz", { cache: "no-store" });
+        const response = await fetch("/healthz", {
+          cache: "no-store"
+        });
 
         if (!response.ok) throw new Error("not ok");
 
@@ -287,28 +406,46 @@ function ServerBanner({ onRecovered }) {
   return html`
     <div className="notice bad">
       The dashboard server is not reachable, so the data below may be old.
-      If its PowerShell window shows a title starting with "Select", press Esc in it.
-      If the window is closed, start it again with .\\run-local.ps1.
+      If its PowerShell window shows a title starting with "Select",
+      press Esc in it. If the window is closed, start it again with
+      .\\run-local.ps1.
     </div>`;
 }
 
-// ---------------------------------------------------------------- environment cards
+// --------------------------------------------------
+// Environment cards
+// --------------------------------------------------
 
 function EnvironmentCard({ env }) {
   const live = env.live || {};
   const traffic = env.traffic || [];
 
-  // The app was asked for its commit and version, but did not answer (for example a cold start).
-  const infoMissing = live.healthOk !== undefined && live.infoOk === false;
-  const unknown = "unknown (/api/info did not answer" + (live.infoError ? ": " + live.infoError : "") + ")";
+  const infoMissing =
+    live.healthOk !== undefined && live.infoOk === false;
 
-  const servingRevision = env.servingRevision || live.revision || env.latestRevision || "-";
+  const unknown =
+    "unknown (/api/info did not answer" +
+    (live.infoError ? ": " + live.infoError : "") +
+    ")";
+
+  const servingRevision =
+    env.servingRevision ||
+    live.revision ||
+    env.latestRevision ||
+    "-";
 
   return html`
     <article className="card">
+
       <header>
-        <h3>${env.label} <span className="muted">(${env.app})</span></h3>
-        <${Badge} kind=${kindOf(env.status)}>${env.status}<//>
+        <h3>
+          ${env.label}
+          <span className="muted">(${env.app})</span>
+        </h3>
+
+        <${Badge} kind=${kindOf(env.status)}>
+          ${env.status}
+        <//>
       </header>
 
       ${(env.errors || []).map((message) =>
@@ -320,25 +457,64 @@ function EnvironmentCard({ env }) {
       )}
 
       <dl>
-        <dt>Commit</dt><dd className="mono">${live.gitSha || (infoMissing ? unknown : "-")}</dd>
-        <dt>Version</dt><dd>${live.version || (infoMissing ? unknown : "-")}</dd>
-        <dt>Environment name</dt><dd>${live.environment || (infoMissing ? unknown : "-")}</dd>
-        <dt>Serving revision</dt><dd className="mono">${servingRevision}</dd>
-        <dt>Image</dt><dd className="mono">${env.imageTag ? "tag " + env.imageTag : env.imageDigest ? "digest " + shortDigest(env.imageDigest) : "-"}</dd>
-        <dt>Health check</dt><dd>${live.healthOk === undefined ? "-" : live.healthOk ? "OK in " + live.healthMs + " ms" : "FAILED " + (live.error || "")}</dd>
-        <dt>Last checked</dt><dd>${formatTime(live.checkedAt)}</dd>
-        <dt>URL</dt><dd><${Ext} href=${env.url}>${env.url || "-"}<//></dd>
+        <dt>Commit</dt>
+        <dd className="mono">
+          ${live.gitSha || (infoMissing ? unknown : "-")}
+        </dd>
+
+        <dt>Version</dt>
+        <dd>${live.version || (infoMissing ? unknown : "-")}</dd>
+
+        <dt>Environment name</dt>
+        <dd>${live.environment || (infoMissing ? unknown : "-")}</dd>
+
+        <dt>Serving revision</dt>
+        <dd className="mono">${servingRevision}</dd>
+
+        <dt>Image</dt>
+        <dd className="mono">
+          ${env.imageTag
+            ? "tag " + env.imageTag
+            : env.imageDigest
+              ? "digest " + shortDigest(env.imageDigest)
+              : "-"}
+        </dd>
+
+        <dt>Health check</dt>
+        <dd>
+          ${live.healthOk === undefined
+            ? "-"
+            : live.healthOk
+              ? "OK in " + live.healthMs + " ms"
+              : "FAILED " + (live.error || "")}
+        </dd>
+
+        <dt>Last checked</dt>
+        <dd>${formatTime(live.checkedAt)}</dd>
+
+        <dt>URL</dt>
+        <dd>
+          <${Ext} href=${env.url}>${env.url || "-"}<//>
+        </dd>
       </dl>
 
       <div>
         <div className="muted">Traffic split</div>
+
         <div className="traffic">
-          ${traffic.map((item, index) =>
-            html`<span key=${index} title=${item.revision + " " + item.weight + "%"} style=${{ width: item.weight + "%" }}></span>`
-          )}
+          ${traffic.map((item, index) => html`
+            <span
+              key=${index}
+              title=${item.revision + " " + item.weight + "%"}
+              style=${{ width: item.weight + "%" }}
+            ></span>
+          `)}
         </div>
+
         <div className="muted mono">
-          ${traffic.map((item) => item.revision + " " + item.weight + "%").join("  |  ") || "-"}
+          ${traffic.map(
+            item => item.revision + " " + item.weight + "%"
+          ).join("  |  ") || "-"}
         </div>
       </div>
 
@@ -349,15 +525,19 @@ function EnvironmentCard({ env }) {
         <${Ext} href=${env.links.applicationInsights}>Application Insights<//>
         <${Ext} href=${env.links.workspace}>Log Analytics<//>
       </div>
+
     </article>`;
 }
 
-// ---------------------------------------------------------------- tables
+// --------------------------------------------------
+// Pipeline table
+// --------------------------------------------------
 
 function PipelinesTable({ runs }) {
   return html`
     <div className="table-wrap">
       <table>
+
         <thead>
           <tr>
             <th>Pipeline</th>
@@ -370,43 +550,61 @@ function PipelinesTable({ runs }) {
             <th></th>
           </tr>
         </thead>
+
         <tbody>
-          ${runs.map((run) => html`
+          ${runs.map(run => html`
             <tr key=${run.id}>
               <td>${run.pipeline}</td>
               <td>${run.number}</td>
-              <td><${Badge} kind=${kindOf(run.state)}>${run.state}<//></td>
+
+              <td>
+                <${Badge} kind=${kindOf(run.state)}>
+                  ${run.state}
+                <//>
+              </td>
+
               <td>${run.branch}</td>
               <td className="mono">${run.shortSha}</td>
               <td>${formatDuration(run.durationSeconds)}</td>
               <td>${formatTime(run.startedAt || run.queuedAt)}</td>
               <td><${Ext} href=${run.url}>Open<//></td>
-            </tr>`)}
+            </tr>
+          `)}
         </tbody>
+
       </table>
     </div>`;
 }
+
+// --------------------------------------------------
+// Deployment table
+// --------------------------------------------------
 
 function DeploymentsTable({ events }) {
   const [filter, setFilter] = useState("all");
 
   const shown = events.filter(
-    (event) => filter === "all" || event.env === filter
+    event => filter === "all" || event.env === filter
   );
 
   return html`
     <div>
+
       <div className="tabs">
-        ${["all", "staging", "production"].map((name) => html`
+        ${["all", "staging", "production"].map(name => html`
           <button
             key=${name}
             className=${filter === name ? "active" : ""}
             onClick=${() => setFilter(name)}
-          >${name}</button>`)}
+          >
+            ${name}
+          </button>
+        `)}
       </div>
 
       <div className="table-wrap">
         <table>
+
           <thead>
             <tr>
               <th>Time</th>
@@ -419,6 +617,7 @@ function DeploymentsTable({ events }) {
               <th></th>
             </tr>
           </thead>
+
           <tbody>
             ${shown.map((event, index) => {
               const display = deploymentOutcome(event);
@@ -428,9 +627,13 @@ function DeploymentsTable({ events }) {
                   <td>${formatTime(event.time)}</td>
                   <td>${event.env}</td>
                   <td>${event.name}</td>
+
                   <td>
-                    <${Badge} kind=${display.kind}>${display.label}<//>
+                    <${Badge} kind=${display.kind}>
+                      ${display.label}
+                    <//>
                   </td>
+
                   <td className="mono">${event.shortSha || "-"}</td>
                   <td className="mono">${event.revision || "-"}</td>
                   <td className="mono">${shortDigest(event.imageDigest)}</td>
@@ -438,16 +641,20 @@ function DeploymentsTable({ events }) {
                 </tr>`;
             })}
           </tbody>
+
         </table>
       </div>
 
       ${shown.length === 0
         ? html`<p className="muted">No deployment events yet.</p>`
         : null}
+
     </div>`;
 }
 
-// ---------------------------------------------------------------- security, SLO, alerts
+// --------------------------------------------------
+// Security
+// --------------------------------------------------
 
 function SecurityBody({ data }) {
   const deployedImages = data.deployedImages || [];
@@ -456,10 +663,14 @@ function SecurityBody({ data }) {
 
   return html`
     <div>
-      <h3 className="muted">Is the image that is running now the image that was scanned?</h3>
+
+      <h3 className="muted">
+        Is the image that is running now the image that was scanned?
+      </h3>
 
       <div className="table-wrap">
         <table>
+
           <thead>
             <tr>
               <th>Environment</th>
@@ -474,47 +685,87 @@ function SecurityBody({ data }) {
               <th>Scanned</th>
             </tr>
           </thead>
+
           <tbody>
-            ${deployedImages.map((item) => {
+            ${deployedImages.map(item => {
               const scan = item.deployedImageScan;
               const verified = item.verification === "MATCH";
 
               return html`
                 <tr key=${item.env}>
                   <td>${item.label}</td>
+
                   <td>
                     <${Badge} kind=${verified ? "good" : "warn"}>
-                      ${verified ? "Verified" : "No scan evidence for this image"}
+                      ${verified
+                        ? "Verified"
+                        : "No scan evidence for this image"}
                     <//>
+
                     ${verified && item.matchedBy
-                      ? html`<div className="muted">matched by ${item.matchedBy}</div>`
+                      ? html`
+                        <div className="muted">
+                          matched by ${item.matchedBy}
+                        </div>`
                       : null}
-                    ${(item.errors || []).map((message) =>
-                      html`<div className="error" key=${message}>${message}</div>`
+
+                    ${(item.errors || []).map(message =>
+                      html`
+                        <div className="error" key=${message}>
+                          ${message}
+                        </div>`
                     )}
                   </td>
-                  <td className="mono">${shortDigest(item.liveImageDigest)}</td>
+
+                  <td className="mono">
+                    ${shortDigest(item.liveImageDigest)}
+                  </td>
+
                   <td>
                     ${scan
-                      ? html`<${Badge} kind=${kindOf(scan.gateResult)}>${scan.gateResult}<//>`
+                      ? html`
+                        <${Badge} kind=${kindOf(scan.gateResult)}>
+                          ${scan.gateResult}
+                        <//>`
                       : "-"}
                   </td>
-                  <td>${scan && scan.criticalCount !== null ? scan.criticalCount : "-"}</td>
-                  <td>${scan && scan.highCount !== null ? scan.highCount : "-"}</td>
-                  <td className="mono">${scan ? scan.shortSha || "-" : "-"}</td>
+
+                  <td>
+                    ${scan && scan.criticalCount !== null
+                      ? scan.criticalCount
+                      : "-"}
+                  </td>
+
+                  <td>
+                    ${scan && scan.highCount !== null
+                      ? scan.highCount
+                      : "-"}
+                  </td>
+
+                  <td className="mono">
+                    ${scan ? scan.shortSha || "-" : "-"}
+                  </td>
+
                   <td>${scan ? scan.trivyVersion || "-" : "-"}</td>
-                  <td className="mono">${scan ? shortDigest(scan.sbomSha256) : "-"}</td>
+
+                  <td className="mono">
+                    ${scan ? shortDigest(scan.sbomSha256) : "-"}
+                  </td>
+
                   <td>${scan ? formatTime(scan.time) : "-"}</td>
                 </tr>`;
             })}
           </tbody>
+
         </table>
       </div>
 
       <p className="muted">
-        Verified means a recorded security scan belongs to the exact image digest that is receiving
-        traffic right now. "No scan evidence" means the image was released before scan results were
-        recorded, or no record could be matched. It does not mean the scan failed: read the Scan gate column.
+        Verified means a recorded security scan belongs to the exact image
+        digest that is receiving traffic right now. "No scan evidence"
+        means the image was released before scan results were recorded,
+        or no record could be matched. It does not mean the scan failed:
+        read the Scan gate column.
       </p>
 
       <h3 className="muted">Security scan history</h3>
@@ -537,24 +788,53 @@ function SecurityBody({ data }) {
                   <th>Scanned</th>
                 </tr>
               </thead>
+
               <tbody>
                 ${scanHistory.map((scan, index) => html`
                   <tr key=${scan.env + scan.time + index}>
                     <td>${scan.label}</td>
-                    <td><${Badge} kind=${kindOf(scan.gateResult)}>${scan.gateResult}<//></td>
-                    <td>${scan.criticalCount === null ? "-" : scan.criticalCount}</td>
-                    <td>${scan.highCount === null ? "-" : scan.highCount}</td>
+
+                    <td>
+                      <${Badge} kind=${kindOf(scan.gateResult)}>
+                        ${scan.gateResult}
+                      <//>
+                    </td>
+
+                    <td>
+                      ${scan.criticalCount === null
+                        ? "-"
+                        : scan.criticalCount}
+                    </td>
+
+                    <td>
+                      ${scan.highCount === null
+                        ? "-"
+                        : scan.highCount}
+                    </td>
+
                     <td className="mono">${scan.shortSha || "-"}</td>
                     <td>${scan.trivyVersion || "-"}</td>
-                    <td className="mono">${shortDigest(scan.scannedImageDigest || scan.deployedImageDigest)}</td>
-                    <td className="mono">${shortDigest(scan.sbomSha256)}</td>
+
+                    <td className="mono">
+                      ${shortDigest(
+                        scan.scannedImageDigest || scan.deployedImageDigest
+                      )}
+                    </td>
+
+                    <td className="mono">
+                      ${shortDigest(scan.sbomSha256)}
+                    </td>
+
                     <td>${formatTime(scan.time)}</td>
-                  </tr>`)}
+                  </tr>
+                `)}
               </tbody>
             </table>
           </div>`}
 
-      <h3 className="muted">Failed CI runs (releases that never reached deployment)</h3>
+      <h3 className="muted">
+        Failed CI runs (releases that never reached deployment)
+      </h3>
 
       ${blockedReleases.length === 0
         ? html`<p className="muted">None in the recent history.</p>`
@@ -571,72 +851,128 @@ function SecurityBody({ data }) {
                   <th></th>
                 </tr>
               </thead>
+
               <tbody>
-                ${blockedReleases.map((run) => html`
+                ${blockedReleases.map(run => html`
                   <tr key=${run.id}>
                     <td>${formatTime(run.finishedAt)}</td>
                     <td>${run.number}</td>
                     <td className="mono">${run.shortSha}</td>
                     <td>${run.failedStep}</td>
+
                     <td>
-                      <${Badge} kind=${run.category === "security gate" ? "bad" : "warn"}>
+                      <${Badge}
+                        kind=${run.category === "security gate" ? "bad" : "warn"}
+                      >
                         ${run.category}
                       <//>
                     </td>
+
                     <td><${Ext} href=${run.url}>Open<//></td>
-                  </tr>`)}
+                  </tr>
+                `)}
               </tbody>
             </table>
           </div>`}
+
     </div>`;
 }
+
+// --------------------------------------------------
+// SLO
+// --------------------------------------------------
 
 function SloBody({ data }) {
   return html`
     <div className="grid two">
-      ${data.items.map((item) => {
+
+      ${data.items.map(item => {
         const slo = item.requestSlo;
 
         return html`
           <div className="card" key=${item.env}>
+
             <header>
               <h3>${item.label}</h3>
+
               ${slo
-                ? html`<${Badge} kind=${slo.sloMet ? "good" : "bad"}>${slo.sloMet ? "SLO met" : "SLO missed"}<//>`
+                ? html`
+                  <${Badge} kind=${slo.sloMet ? "good" : "bad"}>
+                    ${slo.sloMet ? "SLO met" : "SLO missed"}
+                  <//>`
                 : html`<${Badge} kind="muted">no data<//>`}
             </header>
 
-            ${item.errors.map((message) =>
+            ${item.errors.map(message =>
               html`<p className="error" key=${message}>${message}</p>`
             )}
 
             <dl>
-              <dt>Requests (30 days)</dt><dd>${slo ? slo.total : "-"}</dd>
-              <dt>Request success</dt><dd>${slo ? percent(slo.availabilitySli) : "-"} <span className="muted">target ${data.targets.requestSuccessPercent}%</span></dd>
-              <dt>Under 500 ms</dt><dd>${slo ? percent(slo.latencySli) : "-"} <span className="muted">target ${data.targets.latencyUnder500msPercent}%</span></dd>
-              <dt>Error budget used</dt><dd>${slo ? percent(slo.budgetUsedPercent) : "-"}</dd>
-              <dt>Availability test</dt><dd>${item.availability ? percent(item.availability.percent) + " (" + item.availability.passed + "/" + item.availability.total + ")" : "-"} <span className="muted">target ${data.targets.availabilityPercent}%</span></dd>
+              <dt>Requests (30 days)</dt>
+              <dd>${slo ? slo.total : "-"}</dd>
+
+              <dt>Request success</dt>
+              <dd>
+                ${slo ? percent(slo.availabilitySli) : "-"}
+                <span className="muted">
+                  target ${data.targets.requestSuccessPercent}%
+                </span>
+              </dd>
+
+              <dt>Under 500 ms</dt>
+              <dd>
+                ${slo ? percent(slo.latencySli) : "-"}
+                <span className="muted">
+                  target ${data.targets.latencyUnder500msPercent}%
+                </span>
+              </dd>
+
+              <dt>Error budget used</dt>
+              <dd>${slo ? percent(slo.budgetUsedPercent) : "-"}</dd>
+
+              <dt>Availability test</dt>
+              <dd>
+                ${item.availability
+                  ? percent(item.availability.percent) +
+                    " (" + item.availability.passed +
+                    "/" + item.availability.total + ")"
+                  : "-"}
+                <span className="muted">
+                  target ${data.targets.availabilityPercent}%
+                </span>
+              </dd>
             </dl>
+
           </div>`;
       })}
+
     </div>`;
 }
 
+// --------------------------------------------------
+// Alerts
+// --------------------------------------------------
+
 function AlertsBody({ data }) {
   if (data.alerts.length === 0) {
-    return html`<p className="muted">No DeployFlow alerts in the last 7 days.</p>`;
+    return html`
+      <p className="muted">
+        No DeployFlow alerts in the last 7 days.
+      </p>`;
   }
 
-  // Active alerts first, then the history.
   const ordered = data.alerts.slice().sort((a, b) => {
-    const rank = (alert) => (alert.condition === "Fired" ? 0 : 1);
+    const rank = alert => alert.condition === "Fired" ? 0 : 1;
     return rank(a) - rank(b);
   });
 
-  const active = ordered.filter((alert) => alert.condition === "Fired").length;
+  const active = ordered.filter(
+    alert => alert.condition === "Fired"
+  ).length;
 
   return html`
     <div>
+
       <p className=${active ? "error" : "muted"}>
         ${active
           ? active + " alert(s) are firing right now. They clear by themselves when the problem is gone."
@@ -645,6 +981,7 @@ function AlertsBody({ data }) {
 
       <div className="table-wrap">
         <table>
+
           <thead>
             <tr>
               <th>Rule</th>
@@ -655,27 +992,50 @@ function AlertsBody({ data }) {
               <th>Cleared</th>
             </tr>
           </thead>
+
           <tbody>
             ${ordered.map((alert, index) => html`
               <tr key=${alert.rule + index}>
                 <td>${alert.rule}</td>
                 <td>${alert.severity}</td>
+
                 <td>
-                  <${Badge} kind=${alert.condition === "Fired" ? "bad" : alert.condition === "Resolved" ? "good" : "muted"}>
-                    ${alert.condition === "Fired" ? "Active (firing now)" : alert.condition === "Resolved" ? "Resolved" : "Unknown"}
+                  <${Badge}
+                    kind=${alert.condition === "Fired"
+                      ? "bad"
+                      : alert.condition === "Resolved"
+                        ? "good"
+                        : "muted"}
+                  >
+                    ${alert.condition === "Fired"
+                      ? "Active (firing now)"
+                      : alert.condition === "Resolved"
+                        ? "Resolved"
+                        : "Unknown"}
                   <//>
                 </td>
+
                 <td>${alert.target}</td>
                 <td>${formatTime(alert.firedAt)}</td>
-                <td>${alert.condition === "Resolved" ? formatTime(alert.changedAt) : "-"}</td>
-              </tr>`)}
+
+                <td>
+                  ${alert.condition === "Resolved"
+                    ? formatTime(alert.changedAt)
+                    : "-"}
+                </td>
+              </tr>
+            `)}
           </tbody>
+
         </table>
       </div>
+
     </div>`;
 }
 
-// ---------------------------------------------------------------- actions
+// --------------------------------------------------
+// Admin actions
+// --------------------------------------------------
 
 function ActionsPanel({ me }) {
   const [target, setTarget] = useState("");
@@ -705,11 +1065,13 @@ function ActionsPanel({ me }) {
         text: data.message,
         url: data.url
       });
+
     } catch (error) {
       setMessage({
         kind: "bad",
         text: error.message
       });
+
     } finally {
       setBusy(false);
     }
@@ -719,15 +1081,22 @@ function ActionsPanel({ me }) {
   const enabled = me && me.actionsEnabled;
 
   return html`
-    <section className="panel">
-      <h2>Actions</h2>
+    <section className="panel" id="actions">
+
+      <h2>Release Actions</h2>
 
       ${!isAdmin
-        ? html`<p className="muted">You have read-only access. Only administrators can start actions.</p>`
+        ? html`
+          <p className="muted">
+            You have read-only access. Only administrators can start actions.
+          </p>`
         : null}
 
       ${isAdmin && !enabled
-        ? html`<p className="muted">Actions are switched off on this dashboard.</p>`
+        ? html`
+          <p className="muted">
+            Actions are switched off on this dashboard.
+          </p>`
         : null}
 
       <p className="muted">
@@ -735,20 +1104,23 @@ function ActionsPanel({ me }) {
         Production still waits for the approval check in Azure DevOps.
       </p>
 
-      <form className="action" onSubmit=${(event) => event.preventDefault()}>
+      <form
+        className="action"
+        onSubmit=${event => event.preventDefault()}
+      >
         <strong>Request a rollback of production</strong>
 
         <input
           placeholder="Revision to roll back to (empty = previous revision)"
           value=${target}
-          onChange=${(event) => setTarget(event.target.value)}
+          onChange=${event => setTarget(event.target.value)}
           disabled=${!isAdmin || !enabled}
         />
 
         <input
           placeholder="Reason (3-100 characters, no quotes)"
           value=${reason}
-          onChange=${(event) => setReason(event.target.value)}
+          onChange=${event => setReason(event.target.value)}
           disabled=${!isAdmin || !enabled}
         />
 
@@ -761,10 +1133,15 @@ function ActionsPanel({ me }) {
               { targetRevision: target, reason: reason },
               "Queue the production rollback pipeline?"
             )}
-        >Request rollback</button>
+        >
+          Request rollback
+        </button>
       </form>
 
-      <form className="action" onSubmit=${(event) => event.preventDefault()}>
+      <form
+        className="action"
+        onSubmit=${event => event.preventDefault()}
+      >
         <strong>Request a deployment of the latest CI build</strong>
 
         <button
@@ -776,22 +1153,28 @@ function ActionsPanel({ me }) {
               { confirm: true },
               "Queue the CD pipeline for the latest successful CI build?"
             )}
-        >Request deployment</button>
+        >
+          Request deployment
+        </button>
       </form>
 
       ${message
         ? html`
           <div className=${"notice " + message.kind}>
             ${message.text}
+
             ${message.url
               ? html`<${Ext} href=${message.url}>Open the run<//>`
               : null}
           </div>`
         : null}
+
     </section>`;
 }
 
-// ---------------------------------------------------------------- the page
+// --------------------------------------------------
+// Main application
+// --------------------------------------------------
 
 function App() {
   const me = useApi("/api/me", 0);
@@ -819,178 +1202,510 @@ function App() {
     : null;
 
   function refreshAll() {
-    [me, environments, pipelines, deployments, security, slo, alerts]
-      .forEach((item) => item.reload());
+    [
+      me,
+      environments,
+      pipelines,
+      deployments,
+      security,
+      slo,
+      alerts
+    ].forEach(item => item.reload());
   }
 
+  const deploymentSuccess = deploymentStats
+    ? deploymentStats.successRatePercent
+    : 0;
+
+  const pipelineSuccess = pipelineStats
+    ? pipelineStats.overallSuccessRatePercent
+    : 0;
+
   return html`
-    <div>
-      <div className="topbar">
-        <div>
-          <h1>DeployFlow</h1>
-          <div className="sub">
-            Release platform dashboard: live data from Azure and Azure DevOps
+    <div className="app-shell">
+
+      <!-- Sidebar -->
+
+      <aside className="sidebar">
+
+        <div className="brand">
+          <div className="brand-mark">D</div>
+
+          <div>
+            <strong>DeployFlow</strong>
+            <small>Release platform</small>
           </div>
         </div>
 
-        <div className="right">
-          ${me.data
-            ? html`
-              <span>${me.data.user}</span>
-              <${Badge} kind=${me.data.role === "admin" ? "warn" : "muted"}>
-                ${me.data.role}
-              <//>`
+        <div className="nav-label">Overview</div>
+
+        <a className="nav-item active" href="#overview">
+          <span className="nav-icon">▦</span>
+          Dashboard
+        </a>
+
+        <a className="nav-item" href="#environments">
+          <span className="nav-icon">▤</span>
+          Environments
+        </a>
+
+        <a className="nav-item" href="#analytics">
+          <span className="nav-icon">◉</span>
+          Analytics
+        </a>
+
+        <div className="nav-label">Delivery</div>
+
+        <a className="nav-item" href="#pipelines">
+          <span className="nav-icon">⌁</span>
+          Pipelines
+        </a>
+
+        <a className="nav-item" href="#deployments">
+          <span className="nav-icon">⇧</span>
+          Deployments
+        </a>
+
+        <a className="nav-item" href="#incidents">
+          <span className="nav-icon">◈</span>
+          Rollbacks & incidents
+        </a>
+
+        <div className="nav-label">Monitoring</div>
+
+        <a className="nav-item" href="#security">
+          <span className="nav-icon">⬡</span>
+          Security
+        </a>
+
+        <a className="nav-item" href="#slo">
+          <span className="nav-icon">◷</span>
+          SLO & reliability
+        </a>
+
+        <a className="nav-item" href="#alerts">
+          <span className="nav-icon">♧</span>
+          Alerts
+        </a>
+
+        <div className="nav-label">System</div>
+
+        <a className="nav-item" href="#actions">
+          <span className="nav-icon">⚙</span>
+          Release actions
+        </a>
+
+        <div className="sidebar-health">
+          <div className="health-label">
+            <span className="live-dot"></span>
+            Platform health
+          </div>
+
+          <strong>Live monitoring</strong>
+          <small>Azure · Azure DevOps</small>
+        </div>
+
+      </aside>
+
+      <!-- Main workspace -->
+
+      <div className="workspace">
+
+        <div className="topbar">
+
+          <div className="topbar-title">
+            <h1>Dashboard</h1>
+
+            <div className="sub">
+              DeployFlow
+              <span className="separator">/</span>
+              Release operations
+              <span className="separator">/</span>
+
+              <span className="live-status">
+                <i></i>
+                Live data
+              </span>
+            </div>
+          </div>
+
+          <div className="right">
+
+            ${me.data
+              ? html`
+                <span className="user-name">${me.data.user}</span>
+
+                <${Badge}
+                  kind=${me.data.role === "admin" ? "warn" : "muted"}
+                >
+                  ${me.data.role}
+                <//>`
+              : null}
+
+            <button className="btn" onClick=${refreshAll}>
+              <span className="refresh-icon">↻</span>
+              Refresh
+            </button>
+
+          </div>
+        </div>
+
+        <main id="overview">
+
+          <${ServerBanner} onRecovered=${refreshAll} />
+
+          ${me.error
+            ? html`<p className="error">${me.error}</p>`
             : null}
 
-          <button className="btn" onClick=${refreshAll}>Refresh</button>
-        </div>
+          ${environments.error && environments.data
+            ? html`
+              <p className="error">
+                ${environments.error}
+                Showing the last data received at
+                ${formatTime(environments.updated)}.
+              </p>`
+            : null}
+
+          <!-- Environment overview -->
+
+          <div className="section-heading" id="environments">
+            <div>
+              <h2>Environment Status</h2>
+              <p>
+                Current health and serving revisions across your environments
+              </p>
+            </div>
+
+            <span className="section-meta">
+              <span className="live-dot"></span>
+              Auto-refresh enabled
+            </span>
+          </div>
+
+          <div className="grid cards">
+
+            ${environments.data
+              ? environments.data.environments.map(env =>
+                  html`
+                    <${EnvironmentCard}
+                      env=${env}
+                      key=${env.key}
+                    />`
+                )
+              : html`
+                <section className="panel">
+                  <h2>Environment Status</h2>
+
+                  ${environments.error
+                    ? html`<p className="error">${environments.error}</p>`
+                    : html`
+                      <p className="muted">
+                        Loading environment data...
+                      </p>`}
+                </section>`}
+
+          </div>
+
+          <!-- Performance KPIs -->
+
+          <div className="section-heading compact">
+            <div>
+              <h2>Release Performance</h2>
+              <p>
+                Deployment and pipeline metrics for the last 30 days
+              </p>
+            </div>
+          </div>
+
+          <div className="grid kpis">
+
+            <${Kpi}
+              label="Deployment success rate"
+              value=${deploymentStats
+                ? percent(deploymentStats.successRatePercent)
+                : "-"}
+              hint="Last 30 days"
+            />
+
+            <${Kpi}
+              label="Deployments"
+              value=${deploymentStats
+                ? deploymentStats.succeeded + " ok / " +
+                  deploymentStats.failed + " failed"
+                : "-"}
+              hint="Staging and production"
+            />
+
+            <${Kpi}
+              label="Rollbacks"
+              value=${deploymentStats
+                ? deploymentStats.rollbacks
+                : "-"}
+              hint=${deploymentStats
+                ? deploymentStats.automaticRollbacks +
+                  " automatic · " +
+                  deploymentStats.manualRollbacks +
+                  " manual"
+                : ""}
+            />
+
+            <${Kpi}
+              label="Pipeline success rate"
+              value=${pipelineStats
+                ? percent(pipelineStats.overallSuccessRatePercent)
+                : "-"}
+              hint=${pipelineStats
+                ? pipelineStats.overallSucceeded +
+                  " succeeded · " +
+                  pipelineStats.overallFailed +
+                  " failed"
+                : ""}
+            />
+
+            <${Kpi}
+              label="Average CI duration"
+              value=${ci
+                ? formatDuration(ci.averageDurationSeconds)
+                : "-"}
+              hint="Build · scan · push"
+            />
+
+            <${Kpi}
+              label="Average CD duration"
+              value=${cd
+                ? formatDuration(cd.averageDurationSeconds)
+                : "-"}
+              hint="Includes approval wait"
+            />
+
+          </div>
+
+          <!-- Analytics -->
+
+          <div className="section-heading" id="analytics">
+            <div>
+              <h2>Analytics Overview</h2>
+              <p>
+                Visual insights into release performance and reliability
+              </p>
+            </div>
+
+            <span className="section-meta">
+              Last 30 days
+            </span>
+          </div>
+
+          <div className="analytics-grid">
+
+            <${DonutChart}
+              title="Deployment Success"
+              subtitle="Staging and production"
+              value=${deploymentStats
+                ? deploymentStats.succeeded
+                : "-"}
+              percent=${deploymentSuccess}
+              color="#20d989"
+            />
+
+            <${DonutChart}
+              title="Pipeline Reliability"
+              subtitle="CI and CD pipeline runs"
+              value=${pipelineStats
+                ? pipelineStats.overallSucceeded
+                : "-"}
+              percent=${pipelineSuccess}
+              color="#795cff"
+            />
+
+            <${MiniBarChart}
+              title="Deployment Outcomes"
+              subtitle="Deployment activity"
+              items=${[
+                {
+                  label: "Successful",
+                  value: deploymentStats
+                    ? deploymentStats.succeeded
+                    : 0,
+                  color: "#20d989"
+                },
+                {
+                  label: "Failed",
+                  value: deploymentStats
+                    ? deploymentStats.failed
+                    : 0,
+                  color: "#ff5268"
+                },
+                {
+                  label: "Rollbacks",
+                  value: deploymentStats
+                    ? deploymentStats.rollbacks
+                    : 0,
+                  color: "#ffad42"
+                }
+              ]}
+            />
+
+          </div>
+
+          <!-- Pipeline runs -->
+
+          <div className="section-heading compact" id="pipelines">
+            <div>
+              <h2>Release Activity</h2>
+              <p>
+                Recent pipeline executions and deployment history
+              </p>
+            </div>
+          </div>
+
+          <div className="grid dashboard-panels">
+
+            <${Panel}
+              title="Pipeline Runs"
+              state=${pipelines}
+              wide=${true}
+              id="pipeline-panel"
+            >
+              ${pipelines.data
+                ? html`
+                  <div>
+
+                    ${pipelines.data.missingPipelines.length
+                      ? html`
+                        <p className="error">
+                          Pipelines not found:
+                          ${pipelines.data.missingPipelines.join(", ")}
+                        </p>`
+                      : null}
+
+                    <${PipelinesTable}
+                      runs=${pipelines.data.runs}
+                    />
+
+                  </div>`
+                : null}
+            <//>
+
+            <!-- Deployment history -->
+
+            <${Panel}
+              title="Deployment History"
+              state=${deployments}
+              wide=${true}
+              id="deployments"
+            >
+              ${deployments.data
+                ? html`
+                  <div>
+
+                    ${deployments.data.problems.map(message =>
+                      html`
+                        <p className="error" key=${message}>
+                          ${message}
+                        </p>`
+                    )}
+
+                    <${DeploymentsTable}
+                      events=${deployments.data.events}
+                    />
+
+                  </div>`
+                : null}
+            <//>
+
+            <!-- Incidents -->
+
+            <${Panel}
+              title="Deployment Incidents & Failures"
+              state=${deployments}
+              wide=${true}
+              id="incidents"
+            >
+              ${deployments.data
+                ? html`
+                  ${deployments.data.failures.length === 0
+                    ? html`
+                      <p className="muted">
+                        No failed deployments or recovered incidents
+                        in the last 30 days.
+                      </p>`
+                    : html`
+                      <${DeploymentsTable}
+                        events=${deployments.data.failures}
+                      />`}
+                `
+                : null}
+            <//>
+
+            <!-- Security -->
+
+            <${Panel}
+              title="Security & Scan Results"
+              state=${security}
+              wide=${true}
+              id="security"
+            >
+              ${security.data
+                ? html`
+                  <${SecurityBody} data=${security.data} />`
+                : null}
+            <//>
+
+            <!-- SLO -->
+
+            <${Panel}
+              title="Service Reliability & Error Budget"
+              state=${slo}
+              wide=${true}
+              id="slo"
+            >
+              ${slo.data
+                ? html`<${SloBody} data=${slo.data} />`
+                : null}
+            <//>
+
+            <!-- Alerts -->
+
+            <${Panel}
+              title="System Alerts"
+              state=${alerts}
+              wide=${true}
+              id="alerts"
+            >
+              ${alerts.data
+                ? html`<${AlertsBody} data=${alerts.data} />`
+                : null}
+            <//>
+
+          </div>
+
+          <!-- Admin actions -->
+
+          <div className="grid two actions-layout">
+            <${ActionsPanel} me=${me.data} />
+          </div>
+
+          <footer>
+            Live data from Azure Container Apps, Log Analytics,
+            Azure Monitor and Azure DevOps.
+
+            Release actions continue to use the existing
+            protected pipeline workflows.
+          </footer>
+
+        </main>
+
       </div>
-
-      <main>
-        <${ServerBanner} onRecovered=${refreshAll} />
-
-        ${me.error
-          ? html`<p className="error">${me.error}</p>`
-          : null}
-
-        ${environments.error && environments.data
-          ? html`<p className="error">${environments.error} Showing the last data received at ${formatTime(environments.updated)}.</p>`
-          : null}
-
-        <div className="grid cards">
-          ${environments.data
-            ? environments.data.environments.map((env) =>
-                html`<${EnvironmentCard} env=${env} key=${env.key} />`
-              )
-            : html`
-              <section className="panel">
-                <h2>Environments</h2>
-                ${environments.error
-                  ? html`<p className="error">${environments.error}</p>`
-                  : html`<p className="muted">Loading... (the first request can take up to a minute while the apps wake up)</p>`}
-              </section>`}
-        </div>
-
-        <div className="grid kpis">
-          <${Kpi}
-            label="Deployment success rate"
-            value=${deploymentStats ? percent(deploymentStats.successRatePercent) : "-"}
-            hint="last 30 days"
-          />
-
-          <${Kpi}
-            label="Deployments"
-            value=${deploymentStats ? deploymentStats.succeeded + " ok / " + deploymentStats.failed + " failed" : "-"}
-            hint="staging and production"
-          />
-
-          <${Kpi}
-            label="Rollbacks"
-            value=${deploymentStats ? deploymentStats.rollbacks : "-"}
-            hint=${deploymentStats ? deploymentStats.automaticRollbacks + " automatic, " + deploymentStats.manualRollbacks + " manual" : ""}
-          />
-
-          <${Kpi}
-            label="Pipeline success rate"
-            value=${pipelineStats ? percent(pipelineStats.overallSuccessRatePercent) : "-"}
-            hint=${pipelineStats ? pipelineStats.overallSucceeded + " ok / " + pipelineStats.overallFailed + " failed" : ""}
-          />
-
-          <${Kpi}
-            label="Average CI duration"
-            value=${ci ? formatDuration(ci.averageDurationSeconds) : "-"}
-            hint="build, scan, push"
-          />
-
-          <${Kpi}
-            label="Average CD duration"
-            value=${cd ? formatDuration(cd.averageDurationSeconds) : "-"}
-            hint="includes time waiting for approval"
-          />
-        </div>
-
-        <div className="grid">
-          <${Panel} title="Pipeline runs" state=${pipelines} wide=${true}>
-            ${pipelines.data
-              ? html`
-                <div>
-                  ${pipelines.data.missingPipelines.length
-                    ? html`<p className="error">Pipelines not found: ${pipelines.data.missingPipelines.join(", ")}</p>`
-                    : null}
-                  <${PipelinesTable} runs=${pipelines.data.runs} />
-                </div>`
-              : null}
-          <//>
-
-          <${Panel} title="Deployment history" state=${deployments} wide=${true}>
-            ${deployments.data
-              ? html`
-                <div>
-                  ${deployments.data.problems.map((message) =>
-                    html`<p className="error" key=${message}>${message}</p>`
-                  )}
-                  <${DeploymentsTable} events=${deployments.data.events} />
-                </div>`
-              : null}
-          <//>
-
-          <${Panel}
-            title="Deployment incidents and failures"
-            state=${deployments}
-            wide=${true}
-          >
-            ${deployments.data
-              ? html`
-                ${deployments.data.failures.length === 0
-                  ? html`<p className="muted">No failed deployments or recovered incidents in the last 30 days.</p>`
-                  : html`<${DeploymentsTable} events=${deployments.data.failures} />`}
-              `
-              : null}
-          <//>
-
-          <${Panel}
-            title="Security: scan results and policy failures"
-            state=${security}
-            wide=${true}
-          >
-            ${security.data
-              ? html`<${SecurityBody} data=${security.data} />`
-              : null}
-          <//>
-
-          <${Panel}
-            title="Service level objectives and error budget"
-            state=${slo}
-            wide=${true}
-          >
-            ${slo.data
-              ? html`<${SloBody} data=${slo.data} />`
-              : null}
-          <//>
-
-          <${Panel}
-            title="Alerts (last 7 days)"
-            state=${alerts}
-            wide=${true}
-          >
-            ${alerts.data
-              ? html`<${AlertsBody} data=${alerts.data} />`
-              : null}
-          <//>
-        </div>
-
-        <div className="grid two" style=${{ marginTop: "16px" }}>
-          <${ActionsPanel} me=${me.data} />
-        </div>
-
-        <footer>
-          Data comes live from Azure Container Apps, Log Analytics,
-          Azure Monitor and Azure DevOps. Nothing on this page is hard-coded.
-        </footer>
-      </main>
     </div>`;
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(
+// --------------------------------------------------
+// Render application
+// --------------------------------------------------
+
+ReactDOM.createRoot(
+  document.getElementById("root")
+).render(
   html`<${App} />`
 );
