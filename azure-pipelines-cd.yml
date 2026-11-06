@@ -1,3 +1,4 @@
+
 # DeployFlow CD pipeline (Milestone 8)
 #
 # Starts automatically when the CI pipeline's BuildPush stage succeeds on main.
@@ -128,9 +129,12 @@ stages:
                     failOnStandardError: false
                     workingDirectory: $(Build.SourcesDirectory)
 
+                # Publish only on the first staging-stage attempt.
+                # On a retry, reuse the promotion-staging artifact already published
+                # by the earlier attempt in this same pipeline run.
                 - publish: $(Build.ArtifactStagingDirectory)/promotion
                   artifact: promotion-staging
-                  condition: and(always(), eq(variables['promotionReady'], 'true'))
+                  condition: and(always(), eq(variables['promotionReady'], 'true'), eq(variables['System.StageAttempt'], '1'))
                   displayName: Publish staging promotion record
 
   # ---------------------------------------------------------------------------
